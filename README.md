@@ -152,6 +152,9 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   `VICTORY_FFX_SCALE=<scale>` sets the render scale (`0.5` renders 1080p for a
   4K output). Run with `--console series-x` and point `VICTORY_FIDELITYFX_DIR`
   at the FidelityFX SDK's `Kits/FidelityFX/signedbin` folder.
+  `VICTORY_FIDELITYFX_FRAMEGEN=1` adds AMD frame generation
+  (`amd_fidelityfx_framegeneration_dx12.dll` from the same folder) between the
+  presented frames.
 
 ## Credits
 

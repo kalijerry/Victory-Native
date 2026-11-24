@@ -1,0 +1,571 @@
+//! AMD FidelityFX frame generation for frames the title upscales
+//! (diagnostics, `VICTORY_FIDELITYFX_FRAMEGEN=1` beside
+//! `VICTORY_FIDELITYFX_DIR`). The title asks for no frame generation; the
+//! inputs are its upscale's: at each host upscale (`external::record`
+//! through the HLE FidelityFX module) the depth and motion vectors and the
+//! frame's constants are kept, and those of the last submitted list feed
+//! the next present. The presenter's swap chain is then AMD's frame
+//! generation proxy (`amd_fidelityfx_framegeneration_dx12.dll`), which
+//! inserts the generated frames.
+//!
+//! Uses the provider that works from depth and motion vectors (FSR 3
+//! frame generation): AMD frame generation 4 wants the game's view
+//! matrices, which the upscale description does not carry.
+//!
+//! shortcut: an RGBA8 swap chain only; no HUD-less colour, so the UI is
+//! interpolated with the scene.
+
+use std::ffi::{CStr, c_void};
+use std::path::Path;
+use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Direct3D12::{ID3D12CommandQueue, ID3D12Device, D3D12_RESOURCE_BARRIER};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::{DXGI_SWAP_CHAIN_DESC1, IDXGIFactory2, IDXGISwapChain3, IDXGISwapChain4};
+use windows::core::Interface;
+
+use crate::host::HostList;
+use crate::resource::HostTexture;
+
+const DLL: &str = "amd_fidelityfx_framegeneration_dx12.dll";
+const OK: u32 = 0;
+
+// Description types (`ffx_api.h`, `ffx_framegeneration.h`, the DX12 headers).
+const BACKEND_DX12: u64 = 2;
+const PROVIDER_VERSION: u64 = 6;
+const CREATE: u64 = 0x20001;
+const CONFIGURE: u64 = 0x20002;
+const PREPARE: u64 = 0x2000c;
+const VERSION: u64 = 0x2000e;
+const SWAPCHAIN_CREATE: u64 = 0x30006;
+const SWAPCHAIN_WAIT: u64 = 0x30007;
+const SWAPCHAIN_VERSION: u64 = 0x3000b;
+const RGBA8_UNORM: u32 = 10;
+/// Both effects give these bits of their creation flags the same meaning:
+/// HDR, display-resolution motion vectors, jittered motion vectors,
+/// inverted depth.
+const MOTION_DEPTH_FLAGS: u32 = 0b11110;
+/// The FidelityFX resource state of compute reads, and the host's.
+const FFX_COMPUTE_READ: u32 = 1 << 2;
+const HOST_NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+
+#[repr(C)]
+struct Header {
+    kind: u64,
+    next: *mut Header,
+}
+
+fn header(kind: u64) -> Header {
+    Header { kind, next: null_mut() }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Resource {
+    resource: *mut c_void,
+    description: [u32; 8],
+    state: u32,
+}
+
+#[repr(C)]
+struct BackendDx12 {
+    header: Header,
+    device: *mut c_void,
+}
+
+#[repr(C)]
+struct Version {
+    header: Header,
+    version: u32,
+}
+
+#[repr(C)]
+struct SwapchainDesc {
+    header: Header,
+    output: *mut *mut c_void,
+    hwnd: HWND,
+    desc: *const DXGI_SWAP_CHAIN_DESC1,
+    fullscreen_desc: *const c_void,
+    factory: *mut c_void,
+    queue: *mut c_void,
+}
+
+#[repr(C)]
+struct Create {
+    header: Header,
+    flags: u32,
+    display: [u32; 2],
+    max_render: [u32; 2],
+    format: u32,
+}
+
+type Callback = unsafe extern "C" fn(*mut Generate, *mut c_void) -> u32;
+
+#[repr(C)]
+struct Configure {
+    header: Header,
+    swapchain: *mut c_void,
+    present_callback: *const c_void,
+    present_user: *mut c_void,
+    generate_callback: Option<Callback>,
+    generate_user: *mut c_void,
+    enabled: bool,
+    allow_async: bool,
+    hudless: Resource,
+    flags: u32,
+    only_generated: bool,
+    rect: [i32; 4],
+    id: u64,
+}
+
+#[repr(C)]
+struct Prepare {
+    header: Header,
+    id: u64,
+    flags: u32,
+    list: *mut c_void,
+    render: [u32; 2],
+    jitter: [f32; 2],
+    scale: [f32; 2],
+    time_ms: f32,
+    reset: bool,
+    camera: [f32; 4],
+    depth: Resource,
+    motion: Resource,
+    camera_position: [f32; 3],
+    camera_up: [f32; 3],
+    camera_right: [f32; 3],
+    camera_forward: [f32; 3],
+}
+
+#[repr(C)]
+struct Generate {
+    header: Header,
+    list: *mut c_void,
+    color: Resource,
+    output: [Resource; 4],
+    count: u32,
+}
+
+#[repr(C)]
+struct ProviderVersion {
+    header: Header,
+    id: u64,
+    name: *const std::ffi::c_char,
+}
+
+const _: () = {
+    assert!(size_of::<Resource>() == 48);
+    assert!(size_of::<SwapchainDesc>() == 64);
+    assert!(size_of::<Create>() == 40);
+    assert!(size_of::<Configure>() == 144);
+    assert!(size_of::<Prepare>() == 232);
+    assert!(std::mem::offset_of!(Generate, count) == 264);
+};
+
+type CreateFn = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
+type DestroyFn = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
+type CallFn = unsafe extern "C" fn(*mut *mut c_void, *mut Header) -> u32;
+
+struct Api {
+    create: CreateFn,
+    destroy: DestroyFn,
+    configure: CallFn,
+    query: CallFn,
+    dispatch: CallFn,
+}
+
+static API: OnceLock<Api> = OnceLock::new();
+
+/// Loads AMD's frame generation from `dir` (the FidelityFX SDK's
+/// `signedbin`, as for the upscaler); its presence turns frame generation
+/// on. The DLL's version, or why it did not load.
+pub(crate) fn load(dir: &Path) -> Result<String, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+    let path = std::path::absolute(dir.join(DLL)).map_err(|e| e.to_string())?;
+    if !path.is_file() {
+        return Err(format!("no {DLL} there"));
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: a NUL-terminated path; its own folder and System32 only.
+    let module = unsafe { LoadLibraryExW(wide.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    if module.is_null() {
+        return Err(format!("{DLL} did not load ({})", std::io::Error::last_os_error()));
+    }
+    let find = |name: &CStr| {
+        // SAFETY: a loaded module and a NUL-terminated name.
+        unsafe { GetProcAddress(module, name.as_ptr().cast()) }
+            .map(|f| f as *const c_void)
+            .ok_or_else(|| format!("{DLL} has no {}", name.to_string_lossy()))
+    };
+    // SAFETY: the API's exports, with its signatures.
+    let api = unsafe {
+        Api {
+            create: std::mem::transmute::<*const c_void, CreateFn>(find(c"ffxCreateContext")?),
+            destroy: std::mem::transmute::<*const c_void, DestroyFn>(find(c"ffxDestroyContext")?),
+            configure: std::mem::transmute::<*const c_void, CallFn>(find(c"ffxConfigure")?),
+            query: std::mem::transmute::<*const c_void, CallFn>(find(c"ffxQuery")?),
+            dispatch: std::mem::transmute::<*const c_void, CallFn>(find(c"ffxDispatch")?),
+        }
+    };
+    let _ = API.set(api);
+    Ok(path.display().to_string())
+}
+
+fn api() -> Option<&'static Api> {
+    API.get()
+}
+
+/// Whether frame generation is on (its DLL loaded).
+pub(crate) fn enabled() -> bool {
+    API.get().is_some()
+}
+
+/// What frame generation needs of an upscaled frame (see
+/// `external::FrameInputs`), with the host copies of its depth and motion
+/// vectors, which it holds.
+#[derive(Clone)]
+pub(crate) struct Inputs {
+    pub(crate) depth: Arc<HostTexture>,
+    pub(crate) motion: Arc<HostTexture>,
+    pub(crate) frame: crate::external::FrameInputs,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the rest is plain data.
+unsafe impl Send for Inputs {}
+// SAFETY: as above.
+unsafe impl Sync for Inputs {}
+
+static SUBMITTED: Mutex<Option<Inputs>> = Mutex::new(None);
+
+/// At an upscale recorded into `list`: its inputs feed the next present
+/// once the list is submitted (the present runs after it on the queue).
+pub(crate) fn record(list: &HostList, inputs: Inputs) {
+    list.defer_host(move || {
+        *SUBMITTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(inputs.clone());
+    });
+}
+
+fn take_inputs() -> Option<Inputs> {
+    SUBMITTED.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+struct Context {
+    api: &'static Api,
+    handle: *mut c_void,
+}
+
+// SAFETY: the presenter's mutex serializes every use, including the
+// callbacks the proxy makes during Present.
+unsafe impl Send for Context {}
+
+impl Context {
+    fn create(api: &'static Api, desc: &mut Header) -> Result<Self, u32> {
+        let mut ctx = Self { api, handle: null_mut() };
+        // SAFETY: the typed chain and the handle slot live through the call.
+        let code = unsafe { (api.create)(&mut ctx.handle, desc, null()) };
+        if code == OK && !ctx.handle.is_null() { Ok(ctx) } else { Err(code) }
+    }
+
+    fn configure(&self, desc: &mut Configure) -> u32 {
+        // SAFETY: our context and the matching description.
+        unsafe { (self.api.configure)(&mut { self.handle }, &mut desc.header) }
+    }
+
+    fn dispatch(&self, desc: &mut Header) -> u32 {
+        // SAFETY: our context and the matching description.
+        unsafe { (self.api.dispatch)(&mut { self.handle }, desc) }
+    }
+
+    fn provider(&self) -> String {
+        let mut q = ProviderVersion { header: header(PROVIDER_VERSION), id: 0, name: null() };
+        // SAFETY: a provider query on our context.
+        let code = unsafe { (self.api.query)(&mut { self.handle }, &mut q.header) };
+        if code != OK || q.name.is_null() {
+            return String::new();
+        }
+        // SAFETY: a NUL-terminated name the DLL keeps.
+        unsafe { CStr::from_ptr(q.name) }.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        // SAFETY: owned, and no present is in flight when it is released.
+        unsafe { (self.api.destroy)(&mut self.handle, null()) };
+    }
+}
+
+struct Generator {
+    context: Context,
+    generated: AtomicU64,
+    error: AtomicU32,
+}
+
+/// The proxy's call during Present: generate the frames.
+unsafe extern "C" fn generate(desc: *mut Generate, user: *mut c_void) -> u32 {
+    // SAFETY: the configured callback gets our boxed generator and a live
+    // dispatch description the SDK owns.
+    let g = unsafe { &*user.cast::<Generator>() };
+    // SAFETY: as above.
+    let code = unsafe { (g.context.api.dispatch)(&mut { g.context.handle }, desc.cast()) };
+    if code == OK {
+        // SAFETY: the description is live for this call; the SDK may update
+        // the generated-frame count in it.
+        let count = unsafe { std::ptr::addr_of!((*desc).count).read() };
+        g.generated.fetch_add(u64::from(count), Ordering::Relaxed);
+    } else {
+        g.error.store(code, Ordering::Relaxed);
+    }
+    code
+}
+
+/// Frame generation for one presenter: the proxy swap chain's context and
+/// the generator for the current sizes.
+pub(crate) struct Presentation {
+    api: &'static Api,
+    proxy: Context,
+    generator: Option<Box<Generator>>,
+    key: Option<([u32; 2], [u32; 2], u32)>,
+    armed: bool,
+    next_id: u64,
+    continuous: u64,
+    last_frame: u64,
+    base_presents: u32,
+    logged: bool,
+}
+
+impl Presentation {
+    /// The proxy swap chain for `hwnd` and its frame generation, in place
+    /// of the plain one; `None` when off, for another format, or if the
+    /// proxy is refused (the presenter makes a plain one).
+    pub(crate) fn create(
+        factory: &IDXGIFactory2,
+        queue: &ID3D12CommandQueue,
+        hwnd: HWND,
+        desc: &DXGI_SWAP_CHAIN_DESC1,
+    ) -> Option<(IDXGISwapChain3, Self)> {
+        let api = api()?;
+        if desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM {
+            tracing::warn!(format = desc.Format.0, "FidelityFX frame generation: only an RGBA8 swap chain; presenting without it");
+            return None;
+        }
+        let mut version = Version { header: header(SWAPCHAIN_VERSION), version: 4 << 22 };
+        let mut output = null_mut();
+        let mut args = SwapchainDesc {
+            header: Header { kind: SWAPCHAIN_CREATE, next: &mut version.header },
+            output: &mut output,
+            hwnd,
+            desc,
+            fullscreen_desc: null(),
+            factory: factory.as_raw(),
+            queue: queue.as_raw(),
+        };
+        let proxy = Context::create(api, &mut args.header)
+            .inspect_err(|code| tracing::warn!(code, "FidelityFX frame generation: no proxy swap chain; presenting without it"))
+            .ok()?;
+        if output.is_null() {
+            return None;
+        }
+        // SAFETY: the SDK returned an owned IDXGISwapChain4 reference.
+        let swap_chain = unsafe { IDXGISwapChain4::from_raw(output) }.cast().ok()?;
+        tracing::info!(provider = proxy.provider(), "FidelityFX frame generation: proxy swap chain");
+        Some((
+            swap_chain,
+            Self { api, proxy, generator: None, key: None, armed: false, next_id: 0, continuous: 0, last_frame: 0, base_presents: 0, logged: false },
+        ))
+    }
+
+    /// Frame generation off for the coming presents (another size, or no
+    /// upscaled frame): waits for the proxy's queued frames.
+    pub(crate) fn disable(&mut self, chain: &IDXGISwapChain3) {
+        if !self.armed {
+            return;
+        }
+        if let Some(g) = &self.generator {
+            let code = g.context.configure(&mut self.config(chain, false, [0; 2]));
+            if code != OK {
+                tracing::warn!(code, "FidelityFX frame generation: not switched off");
+            }
+        }
+        let _ = self.proxy.dispatch(&mut header(SWAPCHAIN_WAIT));
+        self.armed = false;
+    }
+
+    fn config(&self, chain: &IDXGISwapChain3, armed: bool, display: [u32; 2]) -> Configure {
+        let generator = self.generator.as_deref().filter(|_| armed);
+        Configure {
+            header: header(CONFIGURE),
+            swapchain: chain.as_raw(),
+            present_callback: null(),
+            present_user: null_mut(),
+            generate_callback: generator.map(|_| generate as Callback),
+            generate_user: generator.map_or(null_mut(), |g| std::ptr::from_ref(g).cast_mut().cast()),
+            enabled: armed,
+            allow_async: false,
+            hudless: Resource { resource: null_mut(), description: [0; 8], state: 0 },
+            flags: 0,
+            only_generated: false,
+            rect: [0, 0, display[0] as i32, display[1] as i32],
+            id: self.next_id,
+        }
+    }
+
+    /// Before presenting frame `frame` at `display` size: the generator
+    /// configured and given the last submitted upscale's depth and motion
+    /// (recorded into `list`, which runs before the present). True if
+    /// frames will be generated for this present.
+    pub(crate) fn prepare(
+        &mut self,
+        chain: &IDXGISwapChain3,
+        device: &ID3D12Device,
+        list: &HostList,
+        display: [u32; 2],
+        frame: u64,
+    ) -> bool {
+        let Some(input) = take_inputs().filter(|i| i.frame.render.into_iter().zip(display).all(|(r, d)| r > 0 && r <= d)) else {
+            self.disable(chain);
+            return false;
+        };
+        let flags = input.frame.flags & MOTION_DEPTH_FLAGS;
+        let key = (display, input.frame.render, flags);
+        if self.key != Some(key) {
+            self.renew(chain, device, key);
+        }
+        let Some(g) = &self.generator else { return false };
+        let code = g.context.configure(&mut self.config(chain, true, display));
+        if code != OK {
+            tracing::warn!(code, "FidelityFX frame generation: configure failed");
+            self.disable(chain);
+            return false;
+        }
+        let reset = input.frame.reset || !self.armed || self.last_frame + 1 != frame;
+        let mut barriers = Vec::new();
+        let depth = read(list, &input.depth, input.frame.depth_desc, &mut barriers);
+        let motion = read(list, &input.motion, input.frame.motion_desc, &mut barriers);
+        if !barriers.is_empty() {
+            // SAFETY: an open list and textures the inputs hold.
+            unsafe { list.list.ResourceBarrier(&barriers) };
+        }
+        list.keep(&input.depth.texture);
+        list.keep(&input.motion.texture);
+        let mut prepare = Prepare {
+            header: header(PREPARE),
+            id: self.next_id,
+            flags: 0,
+            list: list.list.as_raw(),
+            render: input.frame.render,
+            jitter: input.frame.jitter,
+            scale: input.frame.motion_scale,
+            time_ms: input.frame.frame_time_ms,
+            reset,
+            camera: input.frame.camera,
+            depth,
+            motion,
+            camera_position: [0.0; 3],
+            camera_up: [0.0, 1.0, 0.0],
+            camera_right: [1.0, 0.0, 0.0],
+            camera_forward: [0.0, 0.0, 1.0],
+        };
+        self.armed = true;
+        let code = g.context.dispatch(&mut prepare.header);
+        if code != OK {
+            tracing::warn!(code, "FidelityFX frame generation: prepare failed");
+            self.disable(chain);
+            return false;
+        }
+        self.last_frame = frame;
+        self.next_id += 1;
+        self.continuous += u64::from(!reset);
+        if self.next_id == 1 {
+            let screen = display;
+            tracing::info!(frame, render = ?input.frame.render, ?screen, "FidelityFX frame generation: first upscaled frame's depth and motion given to it");
+        }
+        true
+    }
+
+    /// A new generator for (display, render, flags).
+    fn renew(&mut self, chain: &IDXGISwapChain3, device: &ID3D12Device, key: ([u32; 2], [u32; 2], u32)) {
+        self.disable(chain);
+        self.generator = None;
+        self.key = Some(key);
+        self.next_id = 0;
+        self.continuous = 0;
+        let _ = self.proxy.dispatch(&mut header(SWAPCHAIN_WAIT));
+        // SAFETY: the proxy swap chain is live; the presenter serializes us.
+        self.base_presents = unsafe { chain.GetLastPresentCount() }.unwrap_or(0);
+        let (screen, render, flags) = key;
+        let mut backend = BackendDx12 { header: header(BACKEND_DX12), device: device.as_raw() };
+        let mut version = Version { header: Header { kind: VERSION, next: &mut backend.header }, version: (4 << 22) | 2 };
+        let mut args = Create { header: Header { kind: CREATE, next: &mut version.header }, flags, display: screen, max_render: render, format: RGBA8_UNORM };
+        match Context::create(self.api, &mut args.header) {
+            Ok(context) => {
+                let provider = context.provider();
+                // Generation 4 wants view matrices, which the upscale has not.
+                if provider.starts_with("3.") {
+                    tracing::info!(provider, ?screen, ?render, "FidelityFX frame generation: generator for the upscaled frames");
+                    self.generator = Some(Box::new(Generator { context, generated: AtomicU64::new(0), error: AtomicU32::new(0) }));
+                } else {
+                    tracing::warn!(provider, "FidelityFX frame generation: this provider wants the game's view matrices; off");
+                }
+            }
+            Err(code) => tracing::warn!(code, ?screen, ?render, "FidelityFX frame generation: no generator"),
+        }
+    }
+
+    /// After presenting frame `frame`: a failed generation switches it off;
+    /// the first steady stretch is logged with the presents it made.
+    pub(crate) fn presented(&mut self, chain: &IDXGISwapChain3, frame: u64) {
+        let Some(g) = &self.generator else { return };
+        let error = g.error.load(Ordering::Relaxed);
+        if error != OK {
+            tracing::warn!(error, "FidelityFX frame generation: generating failed; off");
+            self.disable(chain);
+        } else if !self.logged && self.continuous >= 2 && g.generated.load(Ordering::Relaxed) >= 3 {
+            let waited = self.proxy.dispatch(&mut header(SWAPCHAIN_WAIT));
+            // SAFETY: a live proxy swap chain with completed presents.
+            let presents = unsafe { chain.GetLastPresentCount() }.unwrap_or(0).saturating_sub(self.base_presents);
+            tracing::info!(
+                frame,
+                rendered = self.next_id,
+                continuous = self.continuous,
+                generated = g.generated.load(Ordering::Relaxed),
+                presents,
+                waited,
+                "FidelityFX frame generation: generated frames"
+            );
+            self.logged = true;
+        }
+    }
+}
+
+/// `copy` as frame generation reads it (compute read), moved there in
+/// `list` (`barriers` gets the transition, if any).
+fn read(list: &HostList, copy: &Arc<HostTexture>, description: [u32; 8], barriers: &mut Vec<D3D12_RESOURCE_BARRIER>) -> Resource {
+    barriers.extend(list.move_texture(copy, HOST_NON_PIXEL_SHADER_RESOURCE));
+    Resource { resource: copy.texture.as_raw(), description, state: FFX_COMPUTE_READ }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn without_the_dll_frame_generation_stays_off() {
+        let dir = std::env::temp_dir().join("victory-no-framegen");
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(load(&dir).unwrap_err().contains(DLL));
+    }
+
+    #[test]
+    fn only_the_motion_and_depth_flags_pass() {
+        // HDR | inverted depth | auto exposure (the title's upscale: 0x29).
+        assert_eq!(0x29 & MOTION_DEPTH_FLAGS, 0x8);
+    }
+}

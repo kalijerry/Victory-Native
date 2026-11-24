@@ -46,3 +46,47 @@ pub fn record<R>(
     });
     out
 }
+
+/// What frame generation needs of an upscaled frame besides its depth and
+/// motion vectors: the upscale's constants (as its description has them)
+/// and the motion and depth bits of its creation flags.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FrameInputs {
+    pub render: [u32; 2],
+    pub jitter: [f32; 2],
+    pub motion_scale: [f32; 2],
+    pub frame_time_ms: f32,
+    pub reset: bool,
+    /// Near, far, vertical field of view, metres per view-space unit.
+    pub camera: [f32; 4],
+    pub flags: u32,
+    /// The FidelityFX descriptions of the depth and motion textures.
+    pub depth_desc: [u32; 8],
+    pub motion_desc: [u32; 8],
+}
+
+/// Turns on AMD frame generation for upscaled frames (diagnostics) with
+/// `amd_fidelityfx_framegeneration_dx12.dll` from `dir`: the presenter's
+/// swap chain becomes its proxy. The DLL's path, or why not.
+#[cfg(feature = "diagnostics")]
+pub fn use_frame_generation(dir: &std::path::Path) -> Result<String, String> {
+    crate::framegen::load(dir)
+}
+
+/// At a host upscale recorded into the title list `list`: its depth and
+/// motion textures (title resources) and constants feed frame generation
+/// for the next present, once the list has run. Nothing when it is off.
+#[cfg(feature = "diagnostics")]
+pub fn frame_generation_inputs(list: *const Object, depth: *const Object, motion: *const Object, frame: FrameInputs) {
+    if !crate::framegen::enabled() {
+        return;
+    }
+    let (Some(host), Some(depth), Some(motion)) = (
+        crate::list::host_list(list),
+        crate::resource::host_copy(depth),
+        crate::resource::host_copy(motion),
+    ) else {
+        return;
+    };
+    crate::framegen::record(host, crate::framegen::Inputs { depth, motion, frame });
+}

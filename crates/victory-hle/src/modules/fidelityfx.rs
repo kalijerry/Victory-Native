@@ -13,7 +13,10 @@
 //! the states the title gives, see `victory_gpu::external`). The rest passes
 //! through unchanged: sizes, flags, jitter, motion-vector scale, camera
 //! values, the resource descriptions, the context. Only the upscaler: other
-//! effects (frame generation) are refused.
+//! effects the title asks for (frame generation) are refused. A diagnostics
+//! build generates frames itself from the upscale's depth and motion
+//! vectors with `VICTORY_FIDELITYFX_FRAMEGEN=1` (`victory_gpu::external::
+//! frame_generation_inputs`).
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -161,6 +164,13 @@ pub fn use_host_dir(dir: Option<&Path>) {
         Ok((host, versions)) => {
             tracing::info!(folder = %dir.display(), versions, "FidelityFX: the host's upscaler serves the title's");
             let _ = HOST.set(host);
+            #[cfg(feature = "diagnostics")]
+            if std::env::var_os("VICTORY_FIDELITYFX_FRAMEGEN").is_some_and(|v| v == "1") {
+                match victory_gpu::external::use_frame_generation(dir) {
+                    Ok(dll) => tracing::info!(dll, "FidelityFX: frame generation on the title's upscaled frames"),
+                    Err(why) => tracing::warn!("FidelityFX frame generation: {why}; off"),
+                }
+            }
         }
         Err(why) => tracing::warn!(
             folder = %dir.display(),
@@ -344,10 +354,26 @@ extern "C" fn ffxCreateContext(
         flags = format_args!("{:#x}", upscale.flags),
         "FidelityFX: upscaler context on the host"
     );
+    // SAFETY: a successful create wrote the context.
+    #[cfg(feature = "diagnostics")]
+    context_flags(|f| f.insert(unsafe { *context } as usize, upscale.flags));
     OK
 }
 
+/// The creation flags of each upscaler context, for frame generation's
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn context_flags<R>(f: impl FnOnce(&mut std::collections::HashMap<usize, u32>) -> R) -> R {
+    static FLAGS: std::sync::Mutex<Option<std::collections::HashMap<usize, u32>>> = std::sync::Mutex::new(None);
+    f(FLAGS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+}
+
 extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
+    #[cfg(feature = "diagnostics")]
+    if !context.is_null() {
+        // SAFETY: the title passes its context slot.
+        context_flags(|f| f.remove(&(unsafe { *context } as usize)));
+    }
     // SAFETY: the title passes its context.
     HOST.get()
         .map_or(NO_PROVIDER, |h| unsafe { (h.destroy)(context, memory) })
@@ -402,6 +428,9 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     // SAFETY: an upscaling, by its type.
     let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
     let list = dispatch.list.cast::<Object>().cast_const();
+    // Depth and motion as the title names them, for frame generation.
+    #[cfg(feature = "diagnostics")]
+    let title = dispatch;
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
     for r in dispatch
@@ -429,12 +458,47 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         // SAFETY: a live texture.
         unsafe { t.GetDesc() }.Format.0
     }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
-    victory_gpu::external::record(list, |host_list| {
+    let code = victory_gpu::external::record(list, |host_list| {
         dispatch.list = host_list.as_raw();
         // SAFETY: the PC dispatch on host objects; the context is the host's.
         unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
     })
-    .unwrap_or(PARAMETER)
+    .unwrap_or(PARAMETER);
+    #[cfg(feature = "diagnostics")]
+    if code == OK && !context.is_null() {
+        // SAFETY: the title passes its context slot.
+        let flags = context_flags(|f| f.get(&(unsafe { *context } as usize)).copied()).unwrap_or(0);
+        let (depth, motion) = (title.resources[1], title.resources[2]);
+        if !depth.resource.is_null() && !motion.resource.is_null() {
+            victory_gpu::external::frame_generation_inputs(
+                list,
+                depth.resource.cast::<Object>().cast_const(),
+                motion.resource.cast::<Object>().cast_const(),
+                frame_inputs(&title, flags),
+            );
+        }
+    }
+    code
+}
+
+/// What frame generation needs of an upscaling (`rest` in the order of
+/// `ffxDispatchDescUpscale`: jitter, motion-vector scale, render size,
+/// output size, sharpening, sharpness, frame time, pre-exposure, reset,
+/// camera, flags) and its context's creation `flags`.
+#[cfg(feature = "diagnostics")]
+fn frame_inputs(d: &DispatchUpscale, flags: u32) -> victory_gpu::external::FrameInputs {
+    let f = |i: usize| f32::from_bits(d.rest[i]);
+    victory_gpu::external::FrameInputs {
+        render: [d.rest[4], d.rest[5]],
+        jitter: [f(0), f(1)],
+        motion_scale: [f(2), f(3)],
+        frame_time_ms: f(10),
+        reset: d.rest[12] & 0xff != 0,
+        camera: [f(13), f(14), f(15), f(16)],
+        flags,
+        depth_desc: d.resources[1].description,
+        motion_desc: d.resources[2].description,
+    }
 }
 
 pub(crate) fn module() -> HleModule {
@@ -507,6 +571,29 @@ mod tests {
             resolver.classify("amd_fidelityfx_loader_xbox.dll", &symbol),
             None
         );
+    }
+
+    /// Frame generation reads the upscale's constants from their places in
+    /// the description.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn frame_generation_reads_the_upscales_constants() {
+        let mut rest = [0u32; 18];
+        let floats = [(0, 0.25f32), (1, -0.5), (2, 1920.0), (3, 1080.0), (10, 33.3), (13, 0.1), (14, 1000.0), (15, 1.2), (16, 1.0)];
+        for (i, v) in floats {
+            rest[i] = v.to_bits();
+        }
+        (rest[4], rest[5], rest[12]) = (1920, 1080, 1);
+        let mut resources = [Resource { resource: null_mut(), description: [0; 8], state: 0 }; 7];
+        resources[1].description[1] = 7;
+        resources[2].description[1] = 9;
+        let d = DispatchUpscale { header: header(DISPATCH_UPSCALE, null_mut()), list: null_mut(), resources, rest };
+        let f = frame_inputs(&d, 0x29);
+        assert_eq!(f.render, [1920, 1080]);
+        assert_eq!((f.jitter, f.motion_scale), ([0.25, -0.5], [1920.0, 1080.0]));
+        assert_eq!((f.frame_time_ms, f.reset, f.flags), (33.3, true, 0x29));
+        assert_eq!(f.camera, [0.1, 1000.0, 1.2, 1.0]);
+        assert_eq!((f.depth_desc[1], f.motion_desc[1]), (7, 9));
     }
 
     #[test]
