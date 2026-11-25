@@ -9884,7 +9884,7 @@ impl Host {
             };
             #[cfg(feature = "diagnostics")]
             let (swap_chain, framegen) = match crate::framegen::enabled()
-                .then(|| crate::framegen::Presentation::create(&factory, &self.queue, hwnd, &desc))
+                .then(|| crate::framegen::Presentation::create(&factory, &self.device, &self.queue, hwnd, &desc))
                 .flatten()
             {
                 Some((swap_chain, fg)) => (swap_chain, Some(fg)),

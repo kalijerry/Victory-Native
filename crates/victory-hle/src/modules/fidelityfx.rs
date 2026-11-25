@@ -173,9 +173,11 @@ pub fn use_host_dir(dir: Option<&Path>) {
             tracing::info!(folder = %dir.display(), versions, "FidelityFX: the host's upscaler serves the title's");
             let _ = HOST.set(host);
             #[cfg(feature = "diagnostics")]
-            if std::env::var_os("VICTORY_FIDELITYFX_FRAMEGEN").is_some_and(|v| v == "1") {
-                match victory_gpu::external::use_frame_generation(dir) {
-                    Ok(dll) => tracing::info!(dll, "FidelityFX: frame generation on the title's upscaled frames"),
+            if let Ok(mode) = std::env::var("VICTORY_FIDELITYFX_FRAMEGEN")
+                && matches!(mode.as_str(), "1" | "4")
+            {
+                match victory_gpu::external::use_frame_generation(dir, mode == "4") {
+                    Ok(dll) => tracing::info!(dll, mode, "FidelityFX: frame generation on the title's upscaled frames"),
                     Err(why) => tracing::warn!("FidelityFX frame generation: {why}; off"),
                 }
             }

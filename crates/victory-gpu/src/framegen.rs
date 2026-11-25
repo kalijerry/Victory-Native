@@ -8,9 +8,9 @@
 //! generation proxy (`amd_fidelityfx_framegeneration_dx12.dll`), which
 //! inserts the generated frames.
 //!
-//! Uses the provider that works from depth and motion vectors (FSR 3
-//! frame generation): AMD frame generation 4 wants the game's view
-//! matrices, which the upscale description does not carry.
+//! Mode 1 uses the analytical provider. Experimental mode 4 supplies the
+//! title's world-space camera from its velocity pass when it matches the
+//! current upscale.
 //!
 //! shortcut: an RGBA8 swap chain only; no HUD-less colour, so the UI is
 //! interpolated with the scene.
@@ -29,6 +29,8 @@ use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::resource::HostTexture;
+
+pub(crate) mod camera;
 
 const DLL: &str = "amd_fidelityfx_framegeneration_dx12.dll";
 const OK: u32 = 0;
@@ -221,21 +223,25 @@ struct Api {
     configure: CallFn,
     query: CallFn,
     dispatch: CallFn,
-    generator_provider: u64,
-    swapchain_provider: u64,
+    legacy_providers: Option<Providers>,
+}
+
+#[derive(Clone, Copy)]
+struct Providers {
+    generator: u64,
+    swapchain: u64,
 }
 
 static API: OnceLock<Api> = OnceLock::new();
 
-/// The SDK's built-in version 3 provider for an effect. Enumerating
-/// without a device avoids selecting a driver override that needs camera
-/// matrices this integration cannot provide.
-fn version_three(query: CallFn, effect: u64) -> Option<u64> {
+/// A provider for an effect. A null device enumerates the SDK's built-in
+/// providers. The actual DX12 device also exposes its driver providers.
+fn find_provider(query: CallFn, effect: u64, device: *mut c_void, version: &[u8]) -> Option<u64> {
     let mut count = 0;
     let mut versions = Versions {
         header: header(GET_VERSIONS),
         effect,
-        device: null_mut(),
+        device,
         count: &mut count,
         ids: null_mut(),
         names: null_mut(),
@@ -258,14 +264,16 @@ fn version_three(query: CallFn, effect: u64) -> Option<u64> {
             return None;
         }
         // SAFETY: the API returns static NUL-terminated version names.
-        unsafe { CStr::from_ptr(name) }.to_bytes().starts_with(b"3.").then_some(id)
+        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+        let matches = if version.ends_with(b".") { name.starts_with(version) } else { name == version };
+        matches.then_some(id)
     })
 }
 
 /// Loads AMD's frame generation from `dir` (the FidelityFX SDK's
 /// `signedbin`, as for the upscaler); its presence turns frame generation
 /// on. The DLL's version, or why it did not load.
-pub(crate) fn load(dir: &Path) -> Result<String, String> {
+pub(crate) fn load(dir: &Path, ml: bool) -> Result<String, String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
@@ -288,10 +296,16 @@ pub(crate) fn load(dir: &Path) -> Result<String, String> {
     };
     // SAFETY: the API's query export, with its signature.
     let query = unsafe { std::mem::transmute::<*const c_void, CallFn>(find(c"ffxQuery")?) };
-    let generator_provider = version_three(query, CREATE)
-        .ok_or("no built-in Frame Generation 3 provider")?;
-    let swapchain_provider = version_three(query, SWAPCHAIN_CREATE)
-        .ok_or("no built-in Frame Generation 3 swap chain provider")?;
+    let legacy_providers = if ml {
+        None
+    } else {
+        Some(Providers {
+            generator: find_provider(query, CREATE, null_mut(), b"3.")
+                .ok_or("no built-in Frame Generation 3 provider")?,
+            swapchain: find_provider(query, SWAPCHAIN_CREATE, null_mut(), b"3.")
+                .ok_or("no built-in Frame Generation 3 swap chain provider")?,
+        })
+    };
     // SAFETY: the API's exports, with their signatures.
     let api = unsafe {
         Api {
@@ -300,8 +314,7 @@ pub(crate) fn load(dir: &Path) -> Result<String, String> {
             configure: std::mem::transmute::<*const c_void, CallFn>(find(c"ffxConfigure")?),
             query,
             dispatch: std::mem::transmute::<*const c_void, CallFn>(find(c"ffxDispatch")?),
-            generator_provider,
-            swapchain_provider,
+            legacy_providers,
         }
     };
     let _ = API.set(api);
@@ -317,6 +330,10 @@ pub(crate) fn enabled() -> bool {
     API.get().is_some()
 }
 
+pub(crate) fn ml_enabled() -> bool {
+    api().is_some_and(|api| api.legacy_providers.is_none())
+}
+
 /// What frame generation needs of an upscaled frame (see
 /// `external::FrameInputs`), with the host copies of its depth and motion
 /// vectors, which it holds.
@@ -325,6 +342,7 @@ pub(crate) struct Inputs {
     pub(crate) depth: Arc<HostTexture>,
     pub(crate) motion: Arc<HostTexture>,
     pub(crate) frame: crate::external::FrameInputs,
+    pub(crate) pose: Option<camera::Pose>,
 }
 
 // SAFETY: D3D12 resources are free-threaded; the rest is plain data.
@@ -338,7 +356,11 @@ static SUBMITTED: Mutex<Option<Inputs>> = Mutex::new(None);
 /// once the list is submitted (the present runs after it on the queue).
 pub(crate) fn record(list: &HostList, inputs: Inputs) {
     list.defer_host(move || {
-        *SUBMITTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(inputs.clone());
+        let mut submitted = inputs.clone();
+        if ml_enabled() {
+            submitted.pose = camera::take_matching(submitted.frame.render, submitted.frame.jitter);
+        }
+        *SUBMITTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(submitted);
     });
 }
 
@@ -420,6 +442,7 @@ unsafe extern "C" fn generate(desc: *mut Generate, user: *mut c_void) -> u32 {
 /// the generator for the current sizes.
 pub(crate) struct Presentation {
     api: &'static Api,
+    generator_provider: u64,
     proxy: Context,
     generator: Option<Box<Generator>>,
     key: Option<([u32; 2], [u32; 2], u32)>,
@@ -437,6 +460,7 @@ impl Presentation {
     /// proxy is refused (the presenter makes a plain one).
     pub(crate) fn create(
         factory: &IDXGIFactory2,
+        device: &ID3D12Device,
         queue: &ID3D12CommandQueue,
         hwnd: HWND,
         desc: &DXGI_SWAP_CHAIN_DESC1,
@@ -446,10 +470,22 @@ impl Presentation {
             tracing::warn!(format = desc.Format.0, "FidelityFX frame generation: only an RGBA8 swap chain; presenting without it");
             return None;
         }
+        let providers = if let Some(legacy) = api.legacy_providers {
+            legacy
+        } else {
+            let (Some(generator), Some(swapchain)) = (
+                find_provider(api.query, CREATE, device.as_raw(), b"4.0.2"),
+                find_provider(api.query, SWAPCHAIN_CREATE, device.as_raw(), b"4.0.0"),
+            ) else {
+                tracing::warn!("FidelityFX frame generation: the GPU did not offer the 4.0.2 generator and 4.0.0 proxy; off");
+                return None;
+            };
+            Providers { generator, swapchain }
+        };
         let mut version = Version { header: header(SWAPCHAIN_VERSION), version: 4 << 22 };
         let mut provider = ProviderOverride {
             header: Header { kind: OVERRIDE_VERSION, next: &mut version.header },
-            id: api.swapchain_provider,
+            id: providers.swapchain,
         };
         let mut output = null_mut();
         let mut args = SwapchainDesc {
@@ -469,10 +505,15 @@ impl Presentation {
         }
         // SAFETY: the SDK returned an owned IDXGISwapChain4 reference.
         let swap_chain = unsafe { IDXGISwapChain4::from_raw(output) }.cast().ok()?;
-        tracing::info!(provider = proxy.provider(), "FidelityFX frame generation: proxy swap chain");
+        let proxy_provider = proxy.provider();
+        if api.legacy_providers.is_none() && proxy_provider != "4.0.0" {
+            tracing::warn!(provider = proxy_provider, "FidelityFX frame generation: unexpected ML proxy provider; off");
+            return None;
+        }
+        tracing::info!(provider = proxy_provider, "FidelityFX frame generation: proxy swap chain");
         Some((
             swap_chain,
-            Self { api, proxy, generator: None, key: None, armed: false, next_id: 0, continuous: 0, last_frame: 0, base_presents: 0, logged: false },
+            Self { api, generator_provider: providers.generator, proxy, generator: None, key: None, armed: false, next_id: 0, continuous: 0, last_frame: 0, base_presents: 0, logged: false },
         ))
     }
 
@@ -523,9 +564,22 @@ impl Presentation {
         display: [u32; 2],
         frame: u64,
     ) -> bool {
+        if ml_enabled() {
+            camera::clear();
+        }
         let Some(input) = take_inputs().filter(|i| i.frame.render.into_iter().zip(display).all(|(r, d)| r > 0 && r <= d)) else {
             self.disable(chain);
             return false;
+        };
+        let pose = if ml_enabled() {
+            let Some(pose) = input.pose else {
+                tracing::debug!(frame, "FidelityFX frame generation: no camera matching this upscale");
+                self.disable(chain);
+                return false;
+            };
+            pose
+        } else {
+            camera::Pose::LEGACY
         };
         let flags = input.frame.flags & MOTION_DEPTH_FLAGS;
         let key = (display, input.frame.render, flags);
@@ -562,10 +616,10 @@ impl Presentation {
             camera: input.frame.camera,
             depth,
             motion,
-            camera_position: [0.0; 3],
-            camera_up: [0.0, 1.0, 0.0],
-            camera_right: [1.0, 0.0, 0.0],
-            camera_forward: [0.0, 0.0, 1.0],
+            camera_position: pose.position,
+            camera_up: pose.up,
+            camera_right: pose.right,
+            camera_forward: pose.forward,
         };
         self.armed = true;
         let code = g.context.dispatch(&mut prepare.header);
@@ -579,7 +633,7 @@ impl Presentation {
         self.continuous += u64::from(!reset);
         if self.next_id == 1 {
             let screen = display;
-            tracing::info!(frame, render = ?input.frame.render, ?screen, "FidelityFX frame generation: first upscaled frame's depth and motion given to it");
+            tracing::info!(frame, render = ?input.frame.render, ?screen, camera_pose = ml_enabled(), "FidelityFX frame generation: first upscaled frame's depth and motion given to it");
         }
         true
     }
@@ -599,18 +653,18 @@ impl Presentation {
         let mut version = Version { header: Header { kind: VERSION, next: &mut backend.header }, version: (4 << 22) | 2 };
         let mut provider = ProviderOverride {
             header: Header { kind: OVERRIDE_VERSION, next: &mut version.header },
-            id: self.api.generator_provider,
+            id: self.generator_provider,
         };
         let mut args = Create { header: Header { kind: CREATE, next: &mut provider.header }, flags, display: screen, max_render: render, format: RGBA8_UNORM };
         match Context::create(self.api, &mut args.header) {
             Ok(context) => {
                 let provider = context.provider();
-                // Generation 4 wants view matrices, which the upscale has not.
-                if provider.starts_with("3.") {
+                let expected = if ml_enabled() { provider == "4.0.2" } else { provider.starts_with("3.") };
+                if expected {
                     tracing::info!(provider, ?screen, ?render, "FidelityFX frame generation: generator for the upscaled frames");
                     self.generator = Some(Box::new(Generator { context, generated: AtomicU64::new(0), error: AtomicU32::new(0) }));
                 } else {
-                    tracing::warn!(provider, "FidelityFX frame generation: this provider wants the game's view matrices; off");
+                    tracing::warn!(provider, "FidelityFX frame generation: unexpected generator provider; off");
                 }
             }
             Err(code) => tracing::warn!(code, ?screen, ?render, "FidelityFX frame generation: no generator"),
@@ -658,13 +712,13 @@ mod tests {
     fn without_the_dll_frame_generation_stays_off() {
         let dir = std::env::temp_dir().join("victory-no-framegen");
         let _ = std::fs::create_dir_all(&dir);
-        assert!(load(&dir).unwrap_err().contains(DLL));
+        assert!(load(&dir, false).unwrap_err().contains(DLL));
     }
 
     #[test]
     fn selects_the_builtin_three_provider_for_each_effect() {
         unsafe extern "C" fn query(ctx: *mut *mut c_void, desc: *mut Header) -> u32 {
-            // SAFETY: version_three passes its live Versions descriptor.
+            // SAFETY: find_provider passes its live Versions descriptor.
             let versions = unsafe { &mut *desc.cast::<Versions>() };
             if !ctx.is_null() || versions.header.kind != GET_VERSIONS || !versions.device.is_null() {
                 return 1;
@@ -690,7 +744,7 @@ mod tests {
             OK
         }
 
-        assert_eq!(version_three(query, CREATE), Some(31));
-        assert_eq!(version_three(query, SWAPCHAIN_CREATE), Some(32));
+        assert_eq!(find_provider(query, CREATE, null_mut(), b"3."), Some(31));
+        assert_eq!(find_provider(query, SWAPCHAIN_CREATE, null_mut(), b"3."), Some(32));
     }
 }

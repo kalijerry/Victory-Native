@@ -69,8 +69,8 @@ pub struct FrameInputs {
 /// `amd_fidelityfx_framegeneration_dx12.dll` from `dir`: the presenter's
 /// swap chain becomes its proxy. The DLL's path, or why not.
 #[cfg(feature = "diagnostics")]
-pub fn use_frame_generation(dir: &std::path::Path) -> Result<String, String> {
-    crate::framegen::load(dir)
+pub fn use_frame_generation(dir: &std::path::Path, ml: bool) -> Result<String, String> {
+    crate::framegen::load(dir, ml)
 }
 
 /// At a host upscale recorded into the title list `list`: its depth and
@@ -88,5 +88,5 @@ pub fn frame_generation_inputs(list: *const Object, depth: *const Object, motion
     ) else {
         return;
     };
-    crate::framegen::record(host, crate::framegen::Inputs { depth, motion, frame });
+    crate::framegen::record(host, crate::framegen::Inputs { depth, motion, frame, pose: None });
 }
