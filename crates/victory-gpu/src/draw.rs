@@ -4632,7 +4632,7 @@ fn trace_constant_buffer(stage: &crate::pipeline::host::Stage, roots: &[Root]) {
         let value = std::env::var("VICTORY_TRACE_CBV").ok()?;
         let trace = ConstantBufferTrace::parse(&value);
         if trace.is_none() {
-            tracing::warn!("VICTORY_TRACE_CBV expects shader-hash:slot[+table-dwords]:byte-offset");
+            tracing::warn!("VICTORY_TRACE_CBV expects shader-hash:slot[+table-dwords]:byte-offset[:float-count]");
         }
         trace
     }) else {
@@ -4642,10 +4642,15 @@ fn trace_constant_buffer(stage: &crate::pipeline::host::Stage, roots: &[Root]) {
         return;
     }
     let frame = crate::queue::presented() + 1;
-    if !crate::capture::listed(frame) || LAST_FRAME.load(Ordering::Relaxed) >= frame {
+    static ARM_FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let arm = ARM_FILE.get_or_init(|| std::env::var_os("VICTORY_TRACE_CBV_ARM").map(Into::into));
+    if LAST_FRAME.load(Ordering::Relaxed) >= frame
+        || !arm.as_ref().map_or_else(|| crate::capture::listed(frame), |path| path.is_file())
+    {
         return;
     }
-    let mut bytes = [0; 64];
+    let mut buffer = [0; 512];
+    let bytes = &mut buffer[..trace.float_count * 4];
     let end = trace.offset + bytes.len() as u64;
     let base = match (trace.table_offset, roots.get(usize::from(trace.slot))) {
         (None, Some(Root::View(base)))
@@ -4669,12 +4674,12 @@ fn trace_constant_buffer(stage: &crate::pipeline::host::Stage, roots: &[Root]) {
         _ => return,
     };
     let Some(address) = base.checked_add(trace.offset) else { return };
-    if crate::host::read_into(address as *const u8, &mut bytes)
+    if crate::host::read_into(address as *const u8, bytes)
         && LAST_FRAME.fetch_max(frame, Ordering::Relaxed) < frame
     {
-        let floats: [f32; 16] = std::array::from_fn(|i| {
-            f32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
-        });
+        let floats: Vec<f32> = bytes.as_chunks::<4>().0.iter().copied()
+            .map(f32::from_le_bytes)
+            .collect();
         tracing::info!(
             next_present = frame,
             shader = %trace.hash,
@@ -4693,6 +4698,7 @@ struct ConstantBufferTrace {
     slot: u8,
     table_offset: Option<u32>,
     offset: u64,
+    float_count: usize,
 }
 
 #[cfg(feature = "diagnostics")]
@@ -4706,15 +4712,20 @@ impl ConstantBufferTrace {
             None => (binding.parse().ok()?, None),
         };
         let offset: u64 = parts.next()?.parse().ok()?;
+        let float_count: usize = match parts.next() {
+            Some(count) => count.parse().ok()?,
+            None => 16,
+        };
         if parts.next().is_some()
             || hash.len() != 16
             || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
             || !offset.is_multiple_of(4)
-            || offset > 65_536 - 64
+            || !(1..=128).contains(&float_count)
+            || offset > 65_536 - (float_count as u64 * 4)
         {
             return None;
         }
-        Some(Self { hash: hash.to_owned(), slot, table_offset, offset })
+        Some(Self { hash: hash.to_owned(), slot, table_offset, offset, float_count })
     }
 }
 
@@ -4819,6 +4830,9 @@ mod tests {
         assert_eq!(trace.table_offset, None);
         let table = ConstantBufferTrace::parse(&format!("{HASH}:1+8:64")).unwrap();
         assert_eq!((table.slot, table.table_offset, table.offset), (1, Some(8), 64));
+        assert_eq!(table.float_count, 16);
+        assert_eq!(ConstantBufferTrace::parse(&format!("{HASH}:1+8:0:120")).unwrap().float_count, 120);
+        assert!(ConstantBufferTrace::parse(&format!("{HASH}:1+8:0:129")).is_none());
         assert!(ConstantBufferTrace::parse(&format!("{HASH}:2:65476")).is_none());
         assert!(ConstantBufferTrace::parse(&format!("{HASH}:2:3")).is_none());
         assert!(ConstantBufferTrace::parse("1234:2:0").is_none());
