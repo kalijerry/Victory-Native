@@ -99,9 +99,17 @@ struct DispatchUpscale {
     rest: [u32; 18],
 }
 
-const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
-const _: () = assert!(size_of::<Resource>() == 0x30);
-const _: () = assert!(size_of::<DispatchUpscale>() == 0x1b0);
+// FidelityFX SDK v2.4.0, upscalers/include/ffx_upscale.h.
+const _: () = {
+    use std::mem::offset_of;
+
+    assert!(size_of::<CreateUpscale>() == 0x30);
+    assert!(size_of::<Resource>() == 0x30);
+    assert!(size_of::<DispatchUpscale>() == 0x1b0);
+    assert!(offset_of!(DispatchUpscale, list) == 0x10);
+    assert!(offset_of!(DispatchUpscale, resources) == 0x18); // color
+    assert!(offset_of!(DispatchUpscale, rest) == 0x168); // jitterOffset
+};
 
 /// The versions a backend offers: count in and out, ids, names.
 #[repr(C)]
@@ -470,11 +478,13 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         let flags = context_flags(|f| f.get(&(unsafe { *context } as usize)).copied()).unwrap_or(0);
         let (depth, motion) = (title.resources[1], title.resources[2]);
         if !depth.resource.is_null() && !motion.resource.is_null() {
+            let frame = frame_inputs(&title, flags);
+            once!(info, result = code, render = ?frame.render, "FidelityFX: first successful host upscale");
             victory_gpu::external::frame_generation_inputs(
                 list,
                 depth.resource.cast::<Object>().cast_const(),
                 motion.resource.cast::<Object>().cast_const(),
-                frame_inputs(&title, flags),
+                frame,
             );
         }
     }

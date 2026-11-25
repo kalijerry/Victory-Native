@@ -33,8 +33,11 @@ use crate::resource::HostTexture;
 const DLL: &str = "amd_fidelityfx_framegeneration_dx12.dll";
 const OK: u32 = 0;
 
-// Description types (`ffx_api.h`, `ffx_framegeneration.h`, the DX12 headers).
+// FidelityFX SDK v2.4.0: ffx_api.h, ffx_framegeneration.h,
+// ffx_api_dx12.h, and dx12/ffx_api_framegeneration_dx12.h.
 const BACKEND_DX12: u64 = 2;
+const GET_VERSIONS: u64 = 4;
+const OVERRIDE_VERSION: u64 = 5;
 const PROVIDER_VERSION: u64 = 6;
 const CREATE: u64 = 0x20001;
 const CONFIGURE: u64 = 0x20002;
@@ -44,9 +47,8 @@ const SWAPCHAIN_CREATE: u64 = 0x30006;
 const SWAPCHAIN_WAIT: u64 = 0x30007;
 const SWAPCHAIN_VERSION: u64 = 0x3000b;
 const RGBA8_UNORM: u32 = 10;
-/// Both effects give these bits of their creation flags the same meaning:
-/// HDR, display-resolution motion vectors, jittered motion vectors,
-/// inverted depth.
+/// Display-resolution motion vectors, motion-vector jitter cancellation,
+/// inverted depth, and infinite depth. The upscale HDR flag is separate.
 const MOTION_DEPTH_FLAGS: u32 = 0b11110;
 /// The FidelityFX resource state of compute reads, and the host's.
 const FFX_COMPUTE_READ: u32 = 1 << 2;
@@ -80,6 +82,22 @@ struct BackendDx12 {
 struct Version {
     header: Header,
     version: u32,
+}
+
+#[repr(C)]
+struct Versions {
+    header: Header,
+    effect: u64,
+    device: *mut c_void,
+    count: *mut u64,
+    ids: *mut u64,
+    names: *mut *const std::ffi::c_char,
+}
+
+#[repr(C)]
+struct ProviderOverride {
+    header: Header,
+    id: u64,
 }
 
 #[repr(C)]
@@ -158,12 +176,39 @@ struct ProviderVersion {
 }
 
 const _: () = {
+    use std::mem::offset_of;
+
+    // These x64 offsets catch reordered fields even when the size is unchanged.
     assert!(size_of::<Resource>() == 48);
+    assert!(offset_of!(Resource, description) == 8);
+    assert!(offset_of!(Resource, state) == 40);
+    assert!(size_of::<Versions>() == 56);
+    assert!(offset_of!(Versions, count) == 32);
+    assert!(offset_of!(Versions, ids) == 40);
+    assert!(offset_of!(Versions, names) == 48);
+    assert!(size_of::<ProviderOverride>() == 24);
+    assert!(offset_of!(ProviderOverride, id) == 16);
     assert!(size_of::<SwapchainDesc>() == 64);
+    assert!(offset_of!(SwapchainDesc, output) == 16);
+    assert!(offset_of!(SwapchainDesc, desc) == 32);
+    assert!(offset_of!(SwapchainDesc, queue) == 56);
     assert!(size_of::<Create>() == 40);
+    assert!(offset_of!(Create, display) == 20);
+    assert!(offset_of!(Create, max_render) == 28);
     assert!(size_of::<Configure>() == 144);
+    assert!(offset_of!(Configure, generate_callback) == 40);
+    assert!(offset_of!(Configure, generate_user) == 48);
+    assert!(offset_of!(Configure, enabled) == 56);
+    assert!(offset_of!(Configure, id) == 136);
     assert!(size_of::<Prepare>() == 232);
-    assert!(std::mem::offset_of!(Generate, count) == 264);
+    assert!(offset_of!(Prepare, render) == 40);
+    assert!(offset_of!(Prepare, jitter) == 48);
+    assert!(offset_of!(Prepare, scale) == 56);
+    assert!(offset_of!(Prepare, depth) == 88);
+    assert!(offset_of!(Prepare, motion) == 136);
+    assert!(offset_of!(Generate, color) == 24);
+    assert!(offset_of!(Generate, output) == 72);
+    assert!(offset_of!(Generate, count) == 264);
 };
 
 type CreateFn = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
@@ -176,9 +221,46 @@ struct Api {
     configure: CallFn,
     query: CallFn,
     dispatch: CallFn,
+    generator_provider: u64,
+    swapchain_provider: u64,
 }
 
 static API: OnceLock<Api> = OnceLock::new();
+
+/// The SDK's built-in version 3 provider for an effect. Enumerating
+/// without a device avoids selecting a driver override that needs camera
+/// matrices this integration cannot provide.
+fn version_three(query: CallFn, effect: u64) -> Option<u64> {
+    let mut count = 0;
+    let mut versions = Versions {
+        header: header(GET_VERSIONS),
+        effect,
+        device: null_mut(),
+        count: &mut count,
+        ids: null_mut(),
+        names: null_mut(),
+    };
+    // SAFETY: a null context requests version enumeration. The descriptor
+    // and its count remain live for both calls.
+    if unsafe { query(null_mut(), &mut versions.header) } != OK || !(1..=64).contains(&count) {
+        return None;
+    }
+    let mut ids = vec![0; count as usize];
+    let mut names = vec![null(); count as usize];
+    versions.ids = ids.as_mut_ptr();
+    versions.names = names.as_mut_ptr();
+    // SAFETY: both arrays have the capacity in the count slot.
+    if unsafe { query(null_mut(), &mut versions.header) } != OK {
+        return None;
+    }
+    ids.into_iter().zip(names).take(count as usize).find_map(|(id, name)| {
+        if id == 0 || name.is_null() {
+            return None;
+        }
+        // SAFETY: the API returns static NUL-terminated version names.
+        unsafe { CStr::from_ptr(name) }.to_bytes().starts_with(b"3.").then_some(id)
+    })
+}
 
 /// Loads AMD's frame generation from `dir` (the FidelityFX SDK's
 /// `signedbin`, as for the upscaler); its presence turns frame generation
@@ -204,14 +286,22 @@ pub(crate) fn load(dir: &Path) -> Result<String, String> {
             .map(|f| f as *const c_void)
             .ok_or_else(|| format!("{DLL} has no {}", name.to_string_lossy()))
     };
-    // SAFETY: the API's exports, with its signatures.
+    // SAFETY: the API's query export, with its signature.
+    let query = unsafe { std::mem::transmute::<*const c_void, CallFn>(find(c"ffxQuery")?) };
+    let generator_provider = version_three(query, CREATE)
+        .ok_or("no built-in Frame Generation 3 provider")?;
+    let swapchain_provider = version_three(query, SWAPCHAIN_CREATE)
+        .ok_or("no built-in Frame Generation 3 swap chain provider")?;
+    // SAFETY: the API's exports, with their signatures.
     let api = unsafe {
         Api {
             create: std::mem::transmute::<*const c_void, CreateFn>(find(c"ffxCreateContext")?),
             destroy: std::mem::transmute::<*const c_void, DestroyFn>(find(c"ffxDestroyContext")?),
             configure: std::mem::transmute::<*const c_void, CallFn>(find(c"ffxConfigure")?),
-            query: std::mem::transmute::<*const c_void, CallFn>(find(c"ffxQuery")?),
+            query,
             dispatch: std::mem::transmute::<*const c_void, CallFn>(find(c"ffxDispatch")?),
+            generator_provider,
+            swapchain_provider,
         }
     };
     let _ = API.set(api);
@@ -357,9 +447,13 @@ impl Presentation {
             return None;
         }
         let mut version = Version { header: header(SWAPCHAIN_VERSION), version: 4 << 22 };
+        let mut provider = ProviderOverride {
+            header: Header { kind: OVERRIDE_VERSION, next: &mut version.header },
+            id: api.swapchain_provider,
+        };
         let mut output = null_mut();
         let mut args = SwapchainDesc {
-            header: Header { kind: SWAPCHAIN_CREATE, next: &mut version.header },
+            header: Header { kind: SWAPCHAIN_CREATE, next: &mut provider.header },
             output: &mut output,
             hwnd,
             desc,
@@ -503,7 +597,11 @@ impl Presentation {
         let (screen, render, flags) = key;
         let mut backend = BackendDx12 { header: header(BACKEND_DX12), device: device.as_raw() };
         let mut version = Version { header: Header { kind: VERSION, next: &mut backend.header }, version: (4 << 22) | 2 };
-        let mut args = Create { header: Header { kind: CREATE, next: &mut version.header }, flags, display: screen, max_render: render, format: RGBA8_UNORM };
+        let mut provider = ProviderOverride {
+            header: Header { kind: OVERRIDE_VERSION, next: &mut version.header },
+            id: self.api.generator_provider,
+        };
+        let mut args = Create { header: Header { kind: CREATE, next: &mut provider.header }, flags, display: screen, max_render: render, format: RGBA8_UNORM };
         match Context::create(self.api, &mut args.header) {
             Ok(context) => {
                 let provider = context.provider();
@@ -564,8 +662,35 @@ mod tests {
     }
 
     #[test]
-    fn only_the_motion_and_depth_flags_pass() {
-        // HDR | inverted depth | auto exposure (the title's upscale: 0x29).
-        assert_eq!(0x29 & MOTION_DEPTH_FLAGS, 0x8);
+    fn selects_the_builtin_three_provider_for_each_effect() {
+        unsafe extern "C" fn query(ctx: *mut *mut c_void, desc: *mut Header) -> u32 {
+            // SAFETY: version_three passes its live Versions descriptor.
+            let versions = unsafe { &mut *desc.cast::<Versions>() };
+            if !ctx.is_null() || versions.header.kind != GET_VERSIONS || !versions.device.is_null() {
+                return 1;
+            }
+            let provider_id = match versions.effect {
+                CREATE => 31,
+                SWAPCHAIN_CREATE => 32,
+                _ => return 1,
+            };
+            // SAFETY: count is live. On the second call both arrays have two entries.
+            unsafe {
+                if versions.ids.is_null() && versions.names.is_null() {
+                    *versions.count = 2;
+                } else if *versions.count == 2 && !versions.ids.is_null() && !versions.names.is_null() {
+                    *versions.ids = 40;
+                    *versions.ids.add(1) = provider_id;
+                    *versions.names = c"4.0.2".as_ptr();
+                    *versions.names.add(1) = c"3.1.6".as_ptr();
+                } else {
+                    return 1;
+                }
+            }
+            OK
+        }
+
+        assert_eq!(version_three(query, CREATE), Some(31));
+        assert_eq!(version_three(query, SWAPCHAIN_CREATE), Some(32));
     }
 }
