@@ -4619,7 +4619,7 @@ fn describe(view: Option<&View>) -> String {
 
 /// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
-/// Read one nominated matrix-sized range from a root constant buffer in
+/// Read one nominated matrix-sized range from a constant buffer in
 /// each listed frame. This is a diagnostic for identifying camera data.
 #[cfg(feature = "diagnostics")]
 fn trace_constant_buffer(stage: &crate::pipeline::host::Stage, roots: &[Root]) {
@@ -4632,24 +4632,43 @@ fn trace_constant_buffer(stage: &crate::pipeline::host::Stage, roots: &[Root]) {
         let value = std::env::var("VICTORY_TRACE_CBV").ok()?;
         let trace = ConstantBufferTrace::parse(&value);
         if trace.is_none() {
-            tracing::warn!("VICTORY_TRACE_CBV expects shader-hash:root-slot:byte-offset");
+            tracing::warn!("VICTORY_TRACE_CBV expects shader-hash:slot[+table-dwords]:byte-offset");
         }
         trace
     }) else {
         return;
     };
-    if !stage.shader.hash.eq_ignore_ascii_case(&trace.hash)
-        || !stage.root_cbvs.iter().any(|&(slot, _)| slot == trace.slot)
-    {
+    if !stage.shader.hash.eq_ignore_ascii_case(&trace.hash) {
         return;
     }
     let frame = crate::queue::presented() + 1;
     if !crate::capture::listed(frame) || LAST_FRAME.load(Ordering::Relaxed) >= frame {
         return;
     }
-    let Some(Root::View(base)) = roots.get(usize::from(trace.slot)) else { return };
-    let Some(address) = base.checked_add(trace.offset) else { return };
     let mut bytes = [0; 64];
+    let end = trace.offset + bytes.len() as u64;
+    let base = match (trace.table_offset, roots.get(usize::from(trace.slot))) {
+        (None, Some(Root::View(base)))
+            if stage.root_cbvs.iter().any(|&(slot, _)| slot == trace.slot) => *base,
+        (Some(offset), Some(Root::Table(table))) => {
+            if !stage.translated().used.iter().any(|use_| {
+                use_.root == RootType::Table
+                    && use_.kind == ResourceType::Cbv
+                    && use_.slot == trace.slot
+                    && use_.table_offset_dwords == offset
+            }) {
+                return;
+            }
+            let Some(handle) = table.checked_add(u64::from(offset) * 4) else { return };
+            let Some(View::Constant(base, len)) = crate::descriptor::view(handle) else { return };
+            if end > u64::from(len) {
+                return;
+            }
+            base
+        }
+        _ => return,
+    };
+    let Some(address) = base.checked_add(trace.offset) else { return };
     if crate::host::read_into(address as *const u8, &mut bytes)
         && LAST_FRAME.fetch_max(frame, Ordering::Relaxed) < frame
     {
@@ -4660,9 +4679,10 @@ fn trace_constant_buffer(stage: &crate::pipeline::host::Stage, roots: &[Root]) {
             next_present = frame,
             shader = %trace.hash,
             root_slot = trace.slot,
+            table_offset_dwords = ?trace.table_offset,
             byte_offset = trace.offset,
             values = ?floats,
-            "root constant buffer sample"
+            "constant buffer sample"
         );
     }
 }
@@ -4671,6 +4691,7 @@ fn trace_constant_buffer(stage: &crate::pipeline::host::Stage, roots: &[Root]) {
 struct ConstantBufferTrace {
     hash: String,
     slot: u8,
+    table_offset: Option<u32>,
     offset: u64,
 }
 
@@ -4679,7 +4700,11 @@ impl ConstantBufferTrace {
     fn parse(text: &str) -> Option<Self> {
         let mut parts = text.split(':');
         let hash = parts.next()?;
-        let slot = parts.next()?.parse().ok()?;
+        let binding = parts.next()?;
+        let (slot, table_offset) = match binding.split_once('+') {
+            Some((slot, offset)) => (slot.parse().ok()?, Some(offset.parse().ok()?)),
+            None => (binding.parse().ok()?, None),
+        };
         let offset: u64 = parts.next()?.parse().ok()?;
         if parts.next().is_some()
             || hash.len() != 16
@@ -4689,7 +4714,7 @@ impl ConstantBufferTrace {
         {
             return None;
         }
-        Some(Self { hash: hash.to_owned(), slot, offset })
+        Some(Self { hash: hash.to_owned(), slot, table_offset, offset })
     }
 }
 
@@ -4791,6 +4816,9 @@ mod tests {
         let trace = ConstantBufferTrace::parse(&format!("{HASH}:2:65472")).unwrap();
         assert_eq!(trace.slot, 2);
         assert_eq!(trace.offset, 65472);
+        assert_eq!(trace.table_offset, None);
+        let table = ConstantBufferTrace::parse(&format!("{HASH}:1+8:64")).unwrap();
+        assert_eq!((table.slot, table.table_offset, table.offset), (1, Some(8), 64));
         assert!(ConstantBufferTrace::parse(&format!("{HASH}:2:65476")).is_none());
         assert!(ConstantBufferTrace::parse(&format!("{HASH}:2:3")).is_none());
         assert!(ConstantBufferTrace::parse("1234:2:0").is_none());
