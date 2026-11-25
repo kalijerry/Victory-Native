@@ -127,7 +127,7 @@ pub(crate) fn record(list: &HostList, address: u64, size: u32, viewport: [f32; 2
     let chunks = bytes.as_chunks::<4>().0;
     let words = std::array::from_fn(|i| f32::from_le_bytes(chunks[i]));
     let Some(sample) = Sample::decode(&words, viewport) else { return };
-    list.defer_after(move || {
+    list.defer_host(move || {
         let mut candidates = CANDIDATES.lock().unwrap_or_else(|e| e.into_inner());
         // Keep one extra entry to mark overflow. Overflow and ambiguity
         // both leave the current upscale without a usable camera.

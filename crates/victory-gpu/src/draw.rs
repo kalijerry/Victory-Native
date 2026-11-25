@@ -3757,7 +3757,7 @@ impl State {
         let Some(Root::Table(table)) = self.roots_ref(false).get(1) else { return };
         let Some(handle) = table.checked_add(8 * 4) else { return };
         let Some(View::Constant(address, size)) = crate::descriptor::view(handle) else { return };
-        let Some(viewport) = self.fixed.viewports.as_deref().and_then(|views| views.first()) else { return };
+        let Some(viewport) = self.viewports.first() else { return };
         crate::framegen::camera::record(list, address, size, [viewport.Width, viewport.Height]);
     }
 
@@ -4842,6 +4842,8 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::staging_budget_per_frame;
+    #[cfg(feature = "diagnostics")]
+    use super::ConstantBufferTrace;
 
     #[cfg(feature = "diagnostics")]
     #[test]
