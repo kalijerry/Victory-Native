@@ -35,6 +35,30 @@ const BUFFER_SIZE: u32 = 480;
 const MAX_CANDIDATES: usize = 16;
 static CANDIDATES: Mutex<Vec<Sample>> = Mutex::new(Vec::new());
 
+pub(crate) const WARNING_AFTER_UPSCALES: u8 = 60;
+
+#[derive(Default)]
+pub(crate) struct MissingCameraWarning {
+    misses: u8,
+    warned: bool,
+}
+
+impl MissingCameraWarning {
+    /// Call only when an upscale supplies otherwise usable frame inputs.
+    pub(crate) fn observe(&mut self, matched: bool) -> bool {
+        if self.warned {
+            return false;
+        }
+        if matched {
+            self.misses = 0;
+            return false;
+        }
+        self.misses += 1;
+        self.warned = self.misses == WARNING_AFTER_UPSCALES;
+        self.warned
+    }
+}
+
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a.into_iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -187,5 +211,22 @@ mod tests {
         let mut other = sample;
         other.pose.position[0] += 5.0;
         assert_eq!(unique_match(&[sample, other], size, jitter), None);
+    }
+
+    #[test]
+    fn warns_once_only_after_a_sustained_stretch_without_a_camera() {
+        let mut warning = MissingCameraWarning::default();
+        for _ in 1..WARNING_AFTER_UPSCALES {
+            assert!(!warning.observe(false));
+        }
+        assert!(!warning.observe(true));
+        for _ in 1..WARNING_AFTER_UPSCALES {
+            assert!(!warning.observe(false));
+        }
+        assert!(warning.observe(false));
+        assert!(!warning.observe(true));
+        for _ in 0..WARNING_AFTER_UPSCALES {
+            assert!(!warning.observe(false));
+        }
     }
 }

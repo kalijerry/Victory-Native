@@ -452,6 +452,7 @@ pub(crate) struct Presentation {
     last_frame: u64,
     base_presents: u32,
     logged: bool,
+    missing_camera_warning: camera::MissingCameraWarning,
 }
 
 impl Presentation {
@@ -513,7 +514,7 @@ impl Presentation {
         tracing::info!(provider = proxy_provider, "FidelityFX frame generation: proxy swap chain");
         Some((
             swap_chain,
-            Self { api, generator_provider: providers.generator, proxy, generator: None, key: None, armed: false, next_id: 0, continuous: 0, last_frame: 0, base_presents: 0, logged: false },
+            Self { api, generator_provider: providers.generator, proxy, generator: None, key: None, armed: false, next_id: 0, continuous: 0, last_frame: 0, base_presents: 0, logged: false, missing_camera_warning: camera::MissingCameraWarning::default() },
         ))
     }
 
@@ -572,6 +573,12 @@ impl Presentation {
             return false;
         };
         let pose = if ml_enabled() {
+            if self.missing_camera_warning.observe(input.pose.is_some()) {
+                tracing::warn!(
+                    upscales = camera::WARNING_AFTER_UPSCALES,
+                    "FidelityFX Frame Generation 4.0.2: no matching velocity-pass camera; presenting ordinary frames. The shader pair was verified on title 1.0.2.1. Set VICTORY_LOG=info,victory_gpu::framegen=debug for matching details"
+                );
+            }
             let Some(pose) = input.pose else {
                 tracing::debug!(frame, "FidelityFX frame generation: no camera matching this upscale");
                 self.disable(chain);
