@@ -17,7 +17,8 @@
 //!
 //! What is done here: the six stores are patched (`descriptor_sites`) to set
 //! a byte per slot and per 128 slots in maps of ours ([`MARKS`]), and our own
-//! mirroring marks too; `descriptor::sync_heaps` takes the marked slots
+//! mirroring marks too (and so does the end of +0x4d9f200's copy of a ready
+//! table, every slot of it: issue #301); `descriptor::sync_heaps` takes the marked slots
 //! ([`take`]) in place of the changed pages, and compares and makes only
 //! those, as before.
 //!
@@ -97,6 +98,8 @@ struct Adopted {
     slots: &'static [AtomicU8],
     chunks: &'static [AtomicU8],
     writers: &'static [AtomicUsize],
+    /// The word on top of the stack at that fault: who called a leaf copy.
+    callers: &'static [AtomicUsize],
 }
 
 static ADOPTED: std::sync::RwLock<Option<Adopted>> = std::sync::RwLock::new(None);
@@ -119,13 +122,15 @@ fn adopt_now(start: u64, count: u32) -> bool {
     // goes; a few MB at most.)
     let slots = leak(count);
     let chunks = leak(count.div_ceil(CHUNK));
-    let writers: &'static [AtomicUsize] = Box::leak((0..(count * 32).div_ceil(1 << 16)).map(|_| AtomicUsize::new(0)).collect());
+    let blocks = (count * 32).div_ceil(1 << 16);
+    let writers: &'static [AtomicUsize] = Box::leak((0..blocks).map(|_| AtomicUsize::new(0)).collect());
+    let callers: &'static [AtomicUsize] = Box::leak((0..blocks).map(|_| AtomicUsize::new(0)).collect());
     MARKS.slots.store(slots.as_ptr().cast_mut(), Release);
     MARKS.chunks.store(chunks.as_ptr().cast_mut(), Release);
     MARKS.start.store(start, Release);
     // Last: a store that sees a length sees the rest.
     MARKS.len.store(count as u64 * 32, Release);
-    *adopted = Some(Adopted { start, count, slots, chunks, writers });
+    *adopted = Some(Adopted { start, count, slots, chunks, writers, callers });
     tracing::info!(
         start = format_args!("{start:#x}"),
         count,
@@ -209,9 +214,23 @@ pub(crate) fn take(start: u64) -> Option<Vec<(u32, u32)>> {
     Some(runs)
 }
 
-/// A write fault of the title's at `at` (from its instruction at `rip`),
-/// if in the marked heap: who wrote its block last, for [`missed`].
-pub(crate) fn faulted(at: usize, rip: usize) {
+/// The word at `rsp` (the top of a faulting thread's stack), 0 if it cannot
+/// be read.
+///
+/// # Safety
+/// `rsp` is a faulting thread's stack pointer.
+pub(crate) unsafe fn stack_top(rsp: usize) -> usize {
+    if rsp == 0 || !rsp.is_multiple_of(8) {
+        return 0;
+    }
+    // SAFETY: the thread's own stack, mapped where its pointer is.
+    unsafe { (rsp as *const usize).read() }
+}
+
+/// A write fault of the title's at `at` (from its instruction at `rip`,
+/// `top` on its stack), if in the marked heap: who wrote its block last, for
+/// [`missed`].
+pub(crate) fn faulted(at: usize, rip: usize, top: usize) {
     if MARKS.len.load(Relaxed) == 0 {
         return;
     }
@@ -220,6 +239,9 @@ pub(crate) fn faulted(at: usize, rip: usize) {
         let off = (at as u64).wrapping_sub(a.start);
         if let Some(w) = a.writers.get((off >> 16) as usize) {
             w.store(rip, Relaxed);
+        }
+        if let Some(c) = a.callers.get((off >> 16) as usize) {
+            c.store(top, Relaxed);
         }
     }
 }
@@ -313,9 +335,10 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     }
     let n = CHECKED[1].fetch_add(1, Relaxed);
     MISSED_ALL.fetch_add(1, Relaxed);
-    let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
-    let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
-    let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
+    let block = ((handle - a.start) >> 16) as usize;
+    let rip = a.writers.get(block).map_or(0, |w| w.load(Relaxed));
+    let top = a.callers.get(block).map_or(0, |w| w.load(Relaxed));
+    let writer = writer_name(rip, top);
     {
         let mut by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         *by.entry(writer.clone()).or_default() += 1;
@@ -330,11 +353,60 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     }
 }
 
+/// Where `address` is: in the title's image, or a module and the place in it
+/// (none: code of no module, such as our stubs near the title).
+fn place(address: usize) -> String {
+    let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
+    if address >= base && address < base + size {
+        return format!("title+{:#x}", address - base);
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW};
+        let mut module = std::ptr::null_mut();
+        let mut path = [0u16; 260];
+        // SAFETY: an address, no name; plain queries.
+        unsafe {
+            let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+            if GetModuleHandleExW(flags, address as *const u16, &mut module) != 0 {
+                let len = GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) as usize;
+                let path = String::from_utf16_lossy(&path[..len]);
+                let file = path.rsplit('\\').next().unwrap_or("?").to_string();
+                return format!("{file}+{:#x}", address - module as usize);
+            }
+        }
+    }
+    format!("{address:#x} (no module)")
+}
+
+/// A name for the last writer of a block: its instruction at `rip`, and for
+/// one outside the title the title's code that called it, if the word on top
+/// of its stack (`top`) is in the title.
+fn writer_name(rip: usize, top: usize) -> String {
+    static NAMES: std::sync::Mutex<Option<std::collections::HashMap<(usize, usize), String>>> = std::sync::Mutex::new(None);
+    if rip == 0 {
+        return "not known (no fault on its block)".into();
+    }
+    let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
+    let inside = |a: usize| a >= base && a < base + size;
+    let top = if inside(rip) || !inside(top) { 0 } else { top };
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    names
+        .get_or_insert_with(Default::default)
+        .entry((rip, top))
+        .or_insert_with(|| if top == 0 { place(rip) } else { format!("{} called from {}", place(rip), place(top)) })
+        .clone()
+}
+
 /// The runtime's own `memcpy` and `memmove` ([`import`]).
 static REAL: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
 
-/// Since the last line: the title's copies into the marked heap, records they marked.
-static COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Since the last line: the title's copies into the marked heap, records they
+/// marked; of the copies, those that begin half into a slot, and the view
+/// records they put half into one (issue #301: the ready tables of
+/// +0x4d9f200 are 16-byte aligned, and a record not on a slot's start is
+/// none of the slot model's).
+static COPIES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// What the title's import of `name` (bound to `address`) is bound to: with
 /// the switch, its `memcpy` and `memmove` mark the view records they copy
@@ -380,6 +452,8 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
         let (lo, hi) = ((to as u64).max(start), (to as u64 + n as u64).min(start + len));
         if lo < hi {
             COPIES[0].fetch_add(1, Relaxed);
+            let half = !(to as u64).wrapping_sub(start).is_multiple_of(32);
+            COPIES[2].fetch_add(u64::from(half), Relaxed);
             // Each slot whose first word now lies in the copy and is a view's.
             let mut slot = (lo - start).div_ceil(32);
             let mut marked = 0;
@@ -393,6 +467,19 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
                 slot += 1;
             }
             COPIES[1].fetch_add(marked, Relaxed);
+            if half {
+                // View records half into a slot: counted, not marked.
+                let mut at = start + (lo - start).div_ceil(16) * 16;
+                let mut halves = 0;
+                while at + 4 <= hi {
+                    // SAFETY: as above.
+                    if (at - start) % 32 == 16 && unsafe { (at as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
+                        halves += 1;
+                    }
+                    at += 16;
+                }
+                COPIES[3].fetch_add(halves, Relaxed);
+            }
         }
     }
     out
@@ -432,7 +519,7 @@ pub(crate) fn line(frames: f64) {
     let [taken, takings, ns] = [0, 1, 2].map(|i| TAKEN[i].swap(0, Relaxed));
     let ours = MARKED_BY_US.swap(0, Relaxed);
     let [pages, missed, other, pending, check_ns, tabled] = [0, 1, 2, 3, 4, 5].map(|i| CHECKED[i].swap(0, Relaxed));
-    let copies = [0, 1].map(|i| COPIES[i].swap(0, Relaxed));
+    let copies = [0, 1, 2, 3].map(|i| COPIES[i].swap(0, Relaxed));
     ALL[0].fetch_add(taken, Relaxed);
     ALL[1].fetch_add(ours, Relaxed);
     ALL[2].fetch_add(pages, Relaxed);
@@ -448,7 +535,7 @@ pub(crate) fn line(frames: f64) {
     };
     tracing::info!(
         "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores) in {:.1} takings, {:.3} ms taking; \
-         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
+         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked, {:.1} of the calls half into a slot with {:.1} view records half into one; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
          since the start: {} slots told ({} by our calls), {} pages looked at, {} view records missed; their writers: {}",
         taken as f64 / frames,
         ours as f64 / frames,
@@ -457,6 +544,8 @@ pub(crate) fn line(frames: f64) {
         ns as f64 / 1e6 / frames,
         copies[0] as f64 / frames,
         copies[1] as f64 / frames,
+        copies[2] as f64 / frames,
+        copies[3] as f64 / frames,
         pages as f64 / frames,
         missed as f64 / frames,
         tabled as f64 / frames,

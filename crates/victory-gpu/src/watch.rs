@@ -3830,7 +3830,10 @@ pub(crate) fn install() {
             let waited = _waited;
             if opened != 0 {
                 // Renderer port #2's fallback says who wrote a block of the heap.
-                crate::port_descriptors::faulted(at, r.ExceptionAddress as usize);
+                // (With the top of the stack: a leaf copy's return address.)
+                // SAFETY: the faulting thread's context and its own stack.
+                let top = unsafe { context.as_ref().map_or(0, |c| crate::port_descriptors::stack_top(c.Rsp as usize)) };
+                crate::port_descriptors::faulted(at, r.ExceptionAddress as usize, top);
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
