@@ -51,16 +51,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features --locked -- --test-threads=1
 
+  # The crates that build on Linux too (the shader translator, formats,
+  # pipelines, PE images, game data, xtask): the platform of many who test
+  # under Proton, and minutes sooner than the Windows jobs.
+  linux:
+    name: Linux crates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CRATES: -p victory-core -p victory-pe -p victory-formats -p victory-pipeline -p victory-game -p victory-shader -p xtask
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy $CRATES --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        run: cargo test $CRATES --locked
+
   check:
-    needs: [clippy, test-default, test-diagnostics]
+    needs: [clippy, test-default, test-diagnostics, linux]
     if: always()
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - name: Require all three jobs to pass
+      - name: Require all four jobs to pass
         run: |
           if ('${{ needs.clippy.result }}' -ne 'success' -or
               '${{ needs.test-default.result }}' -ne 'success' -or
-              '${{ needs.test-diagnostics.result }}' -ne 'success') {
+              '${{ needs.test-diagnostics.result }}' -ne 'success' -or
+              '${{ needs.linux.result }}' -ne 'success') {
             exit 1
           }
