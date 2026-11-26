@@ -835,6 +835,12 @@ pub fn finished_with(
 
 /// Like [`finished_with`], but the result comes from `work`, run on a
 /// thread of ours; the call stays pending until it returns (a dialog, say).
+///
+/// The state is shared between the call and the thread. A cancel ends the
+/// call and cleans up at once while the work may still run (the dialog stays
+/// open), so the thread keeps its own reference and, when the work returns,
+/// completes the call it was started for, never by block: after a cancel the
+/// title may already have begun another call on the same block.
 pub fn pending_with(
     block: *mut AsyncBlock,
     identity: *const c_void,
@@ -843,16 +849,26 @@ pub fn pending_with(
     type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
-        // boxed state until cleanup frees it.
+        // call's reference to the shared state until cleanup gives it up.
         let data = unsafe { &*data };
-        let state = data.context.cast::<Data>();
+        let state = data.context.cast_const().cast::<Data>();
         match op {
-            // SAFETY: boxed in `pending_with`; nothing runs after cleanup.
-            OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
+            // SAFETY: from `Arc::into_raw` in `pending_with`; cleanup runs once.
+            OP_CLEANUP => drop(unsafe { Arc::from_raw(state) }),
             OP_BEGIN => {
-                // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
-                let (block, state) = (data.block as usize, state as usize);
+                // The call is filed before its begin runs.
+                let Some(call) = call(data.block) else {
+                    return E_ABORT;
+                };
+                // SAFETY: the call's reference lives at least until its
+                // cleanup, which cannot run before begin returns; this one is
+                // the thread's own.
+                let state = unsafe {
+                    Arc::increment_strong_count(state);
+                    Arc::from_raw(state)
+                };
+                let work = state.lock().unwrap_or_else(|e| e.into_inner()).0.take();
+                let block = data.block as usize;
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
                     let (hr, len) = match &result {
@@ -860,11 +876,10 @@ pub fn pending_with(
                         Err(hr) => (*hr, 0),
                     };
                     if let Ok(bytes) = result {
-                        // SAFETY: the call is pending, so its state lives.
-                        let state = unsafe { &*(state as *const Data) };
                         state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
                     }
-                    XAsyncComplete(block as *mut AsyncBlock, hr, len);
+                    // A call already over (canceled) is left alone.
+                    complete_call(&call, block as *mut AsyncBlock, hr, len);
                 });
             }
             // SAFETY: as above; the runtime checked the buffer's size.
@@ -878,12 +893,12 @@ pub fn pending_with(
         }
         S_OK
     }
-    let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
-    let context = Box::into_raw(state);
-    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    let state: Arc<Data> = Arc::new(Mutex::new((Some(Box::new(work)), Vec::new())));
+    let context = Arc::into_raw(state);
+    let hr = XAsyncBegin(block, context.cast_mut().cast(), identity, std::ptr::null(), Some(provider));
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
-        drop(unsafe { Box::from_raw(context) });
+        drop(unsafe { Arc::from_raw(context) });
     }
     hr
 }
@@ -1375,6 +1390,57 @@ mod tests {
         XAsyncCancel(&mut block);
         assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
         XTaskQueueCloseHandle(q);
+    }
+
+    /// A call whose work runs on a thread of ours (the text-entry dialog),
+    /// canceled while that work still runs: the call's cleanup must not take
+    /// the state from under the work, and the work's end must not complete a
+    /// call the title has begun on the same block since.
+    #[test]
+    fn a_canceled_pending_call_leaves_the_next_call_alone() {
+        /// Never completes by itself.
+        extern "system" fn idle(_: u32, _: *const ProviderData) -> HRESULT {
+            S_OK
+        }
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let identity = 0x5e as *const c_void;
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (returned, returning) = std::sync::mpsc::channel::<()>();
+        let hr = pending_with(&mut block, identity, move || {
+            held.recv().ok();
+            returned.send(()).ok();
+            Ok(vec![1, 2, 3])
+        });
+        assert_eq!(hr, S_OK);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+
+        // Canceled while the work runs: the call ends and is cleaned up.
+        XAsyncCancel(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        assert!(call(&mut block).is_none());
+        // The title begins another call on the same block.
+        assert_eq!(
+            XAsyncBegin(&mut block, std::ptr::null_mut(), identity, std::ptr::null(), Some(idle)),
+            S_OK
+        );
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+
+        // The work returns: the new call stays pending.
+        release.send(()).unwrap();
+        returning.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+        let mut size = usize::MAX;
+        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), E_PENDING);
+        assert_eq!(size, usize::MAX, "no result size from the canceled call");
+
+        XAsyncCancel(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
     }
 
     #[test]
