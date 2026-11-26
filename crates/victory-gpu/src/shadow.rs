@@ -2056,12 +2056,31 @@ const KERNEL_PAGE: usize = 4096;
 /// Proton two main characters of the boat cutscene had no facial skin with
 /// it, and every face was right with it alone off, at the same frame rate
 /// (#59, bisected over play.ps1's switches). `-Safe` already turned it off.
+/// `VICTORY_AB` naming it still turns it on and off there, as elsewhere.
 fn land_echo() -> bool {
     static WINE_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *WINE_OFF.get_or_init(|| std::env::var_os("VICTORY_LAND_ECHO").is_none() && on_wine()) {
+    if *WINE_OFF.get_or_init(|| {
+        std::env::var_os("VICTORY_LAND_ECHO").is_none()
+            && !ab_named("VICTORY_LAND_ECHO")
+            && on_wine()
+    }) {
         return false;
     }
     crate::toggled!("VICTORY_LAND_ECHO")
+}
+
+/// Whether `VICTORY_AB` turns `switch` on and off in this run (diagnostics
+/// builds; `crate::ab`).
+fn ab_named(switch: &str) -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::ab::bit(switch).is_some()
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = switch;
+        false
+    }
 }
 
 /// Whether we run under Wine: its ntdll exports `wine_get_version` (as
