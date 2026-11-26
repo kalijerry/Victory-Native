@@ -48,6 +48,15 @@ struct Thread {
     samples: u64,
 }
 
+impl Drop for Thread {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: this record owns the handle returned by OpenThread.
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
 fn cpu(thread: HANDLE) -> u64 {
     // SAFETY: zeroed is a valid FILETIME, and the calls write them.
     let mut t: [FILETIME; 4] = unsafe { std::mem::zeroed() };
@@ -155,10 +164,6 @@ fn write(
     let mut names: HashMap<u64, String> = HashMap::new();
     for (id, t) in threads {
         writeln!(out, "thread {id} {} {} {} {}", t.start, (t.now - t.first) / 10_000, t.samples, t.name)?;
-        if !t.handle.is_null() {
-            // SAFETY: opened by `choose`.
-            unsafe { CloseHandle(t.handle) };
-        }
     }
     for ((id, phase, frames), n) in counts {
         write!(out, "stack {id} {phase} {n} ")?;
@@ -174,6 +179,64 @@ fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::{AsHandle, AsRawHandle, IntoRawHandle};
+    use std::path::Path;
+    use windows_sys::Win32::Foundation::CompareObjectHandles;
+
+    fn write_one_thread(path: &Path) -> std::io::Result<()> {
+        let worker = std::thread::spawn(|| {});
+        let reference = worker.as_handle().try_clone_to_owned().unwrap();
+        worker.join().unwrap();
+        let handle = reference.try_clone().unwrap().into_raw_handle();
+        let still_open = || {
+            // SAFETY: reference keeps the finished thread alive. Comparing object
+            // identity also works if Windows reuses the closed handle for another object.
+            unsafe { CompareObjectHandles(handle, reference.as_raw_handle()) != 0 }
+        };
+        let thread = Thread {
+            handle,
+            start: "start".into(),
+            name: "worker".into(),
+            first: 10_000,
+            last: 30_000,
+            now: 30_000,
+            samples: 1,
+        };
+        let threads = HashMap::from([(7, thread)]);
+        assert!(still_open());
+        let result = write(
+            path.to_str().unwrap(),
+            &threads,
+            &HashMap::new(),
+            &HashMap::new(),
+            1,
+        );
+        assert!(still_open(), "write closed a handle it only borrowed");
+        drop(threads);
+        assert!(!still_open(), "dropping the profile left its thread handle open");
+        result
+    }
+
+    #[test]
+    fn thread_handle_lives_until_the_written_profile_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.txt");
+        write_one_thread(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "rounds 1\nthread 7 start 2 1 worker\n"
+        );
+    }
+
+    #[test]
+    fn thread_handle_is_released_when_report_creation_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("profile.txt");
+        assert_eq!(
+            write_one_thread(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
 
     #[test]
     fn what_is_asked_is_read_whole_or_not_at_all() {
