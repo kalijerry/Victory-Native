@@ -2171,6 +2171,79 @@ mod tests {
     }
 
     #[test]
+    fn physical_pages_map_caller_split_placeholders() {
+        use windows_sys::Win32::System::Memory::MEM_MAPPED;
+
+        const N: usize = 5;
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            N * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let at = |i: usize| base.wrapping_byte_add(i * PAGE);
+        let check_slice = |i: usize, state| {
+            let info = query(at(i)).host;
+            assert_eq!(info.AllocationBase, at(i), "allocation base of slice {i}");
+            assert_eq!(info.RegionSize, PAGE, "size of slice {i}");
+            assert_eq!(info.State, state, "state of slice {i}");
+            if state == MEM_COMMIT {
+                assert_eq!(info.Type, MEM_MAPPED);
+                assert_eq!(info.Protect, PAGE_READWRITE);
+            }
+        };
+
+        // The caller cuts four prefixes off the reservation before XMem maps anything.
+        let reservation = query(base).host;
+        assert_eq!(reservation.State, MEM_RESERVE);
+        assert_eq!(reservation.RegionSize, N * PAGE);
+        for i in 0..N - 1 {
+            assert_ne!(title_virtual_free(at(i), PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 0);
+        }
+        for i in 0..N {
+            check_slice(i, MEM_RESERVE);
+        }
+
+        let pages = allocate(N);
+        let marker = |i: usize| (i + 1) as u8;
+        let check_marker = |i: usize| {
+            check_slice(i, MEM_COMMIT);
+            // SAFETY: the query above confirmed a committed read-write view at this address.
+            assert_eq!(unsafe { at(i).cast::<u8>().read() }, marker(i), "slice {i}");
+        };
+        for (i, page) in pages.iter().enumerate() {
+            assert_eq!(XMemMapPhysicalPages(at(i), 1, page), at(i));
+            check_slice(i, MEM_COMMIT);
+            // SAFETY: this test owns the read-write view just verified.
+            unsafe { at(i).cast::<u8>().write(marker(i)) };
+            for j in 0..i {
+                check_marker(j);
+            }
+            for j in i + 1..N {
+                check_slice(j, MEM_RESERVE);
+            }
+        }
+
+        let middle = N / 2;
+        assert_eq!(XMemMapPhysicalPages(at(middle), 1, std::ptr::null()), at(middle));
+        check_slice(middle, MEM_RESERVE);
+        for i in (0..N).filter(|&i| i != middle) {
+            check_marker(i);
+        }
+
+        for i in 0..N {
+            if i != middle {
+                assert_eq!(XMemMapPhysicalPages(at(i), 1, std::ptr::null()), at(i));
+            }
+            check_slice(i, MEM_RESERVE);
+            assert_ne!(title_virtual_free(at(i), 0, MEM_RELEASE), 0);
+        }
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    #[test]
     fn physical_pages_map_alias_and_unmap() {
         let mut pages = [0usize; 3];
         let mut n = 3;
