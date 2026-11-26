@@ -346,14 +346,14 @@ pub(crate) fn sync_heaps() {
         kinds[4] += before.len() as u64 - of_tables;
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
-        // Ranges of the heap to look at, and whether a range is one the
-        // fallback of renderer port #2 looks at whole.
+        // Ranges of the heap to look at, and whether a range came from the
+        // fallback of renderer port #2.
         let mut parts: Vec<(usize, usize, bool)> = Vec::new();
         let port = crate::port_descriptors::adopted(start);
         if port {
             // Renderer port #2: the slots the title's patched stores and our
             // calls marked, in place of the changed pages; and a few of the
-            // pages the watch says were written, looked at whole.
+            // pages the watch says were written, excluding slots already marked.
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
             for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
                 let from = start as usize + first as usize * step as usize;
@@ -368,8 +368,14 @@ pub(crate) fn sync_heaps() {
                 spent[0] += since(began);
                 crate::port_descriptors::asked(&taken);
             }
+            let marked = parts.len();
             for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
+                add_unmarked_fallback(
+                    &mut parts,
+                    marked,
+                    page.max(start as usize),
+                    (page + crate::watch::PAGE).min(end as usize),
+                );
             }
         } else {
             let began = std::time::Instant::now();
@@ -733,6 +739,35 @@ pub(crate) fn sync_line(frames: f64) {
         split[3] / 1e6 / frames,
         split[4] / 1e6 / frames
     );
+}
+
+/// Append the gaps in a fallback page. The first `marked` entries are the
+/// sorted, disjoint runs from `port_descriptors::take`.
+#[cfg(windows)]
+fn add_unmarked_fallback(
+    parts: &mut Vec<(usize, usize, bool)>,
+    marked: usize,
+    from: usize,
+    to: usize,
+) {
+    let mut cursor = from;
+    let first = parts[..marked].partition_point(|&(_, end, _)| end <= from);
+    for index in first..marked {
+        let (start, end, _) = parts[index];
+        if start >= to {
+            break;
+        }
+        if cursor < start {
+            parts.push((cursor, start, true));
+        }
+        cursor = cursor.max(end);
+        if cursor >= to {
+            return;
+        }
+    }
+    if cursor < to {
+        parts.push((cursor, to, true));
+    }
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
@@ -1727,6 +1762,21 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn fallback_mirrors_only_unmarked_slots() {
+        let mut parts = vec![(32, 96, false), (128, 160, false), (192, 224, false)];
+        let marked = parts.len();
+        add_unmarked_fallback(&mut parts, marked, 0, 128);
+        add_unmarked_fallback(&mut parts, marked, 128, 192);
+        add_unmarked_fallback(&mut parts, marked, 192, 256);
+        add_unmarked_fallback(&mut parts, marked, 64, 96);
+        assert_eq!(
+            parts[marked..],
+            [(0, 32, true), (96, 128, true), (160, 192, true), (224, 256, true)]
+        );
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
