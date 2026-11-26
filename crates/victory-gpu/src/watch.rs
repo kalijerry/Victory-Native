@@ -2166,9 +2166,11 @@ pub(crate) fn look_at_holes() {
         }
         if block >= until {
             // (Or unmapped memory was mapped since the part was taken: told
-            // already, and forgotten.)
+            // already, and forgotten. Re-check under the lock so a concurrent
+            // remap+unmap cycle cannot lose a fresh placeholder from `held`.)
             let g = guards();
-            if g.held.remove(block) {
+            if g.held.contains(block) && uncommitted_end(block) <= block {
+                g.held.remove(block);
                 PUBLISHED.clear(block);
                 static SAID: std::sync::Once = std::sync::Once::new();
                 SAID.call_once(|| {
