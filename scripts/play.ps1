@@ -19,12 +19,18 @@ $settings = @{
     VICTORY_SHOW_AFTER = '1'; VICTORY_D3D12_DRED = 'light'
 }
 if ($Safe) {
-    $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
+    # Steps done on the card are off by default in the code; stage 2 removed the device in #13.
+    # (VICTORY_RELAY stays at 2, the code's default: the first room's walls were missing without it.)
+    $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'; $settings.VICTORY_CARD_STEPS = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+if ($Build -eq 'release' -and $settings.ContainsKey('VICTORY_D3D12_DRED')) {
+    # Read only by a build with the diagnostics feature (crates/victory-gpu/src/host.rs).
+    Write-Host 'VICTORY_D3D12_DRED does nothing unless this release build has the diagnostics feature; -Build diag has it.'
+}
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
