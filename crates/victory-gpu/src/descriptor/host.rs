@@ -5517,7 +5517,17 @@ mod tests {
             return; // no host GPU here
         };
         let memory = vec![0u64; 1 << 13];
-        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let mut start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // Pick a page whose `+8` offset is not a multiple of the 456-byte
+        // structured element stride inside any loose-window grid (64 KiB..4 MiB):
+        // `456 = 8 * 57`, so a random 4 KiB heap page otherwise lands on an
+        // element boundary ~1 in 57 runs and legitimately uses the loose window.
+        while [64 << 10, 128 << 10, 256 << 10, 512 << 10, 1 << 20, 2 << 20, 4 << 20]
+            .iter()
+            .any(|&grid| ((start + 8) % grid).is_multiple_of(456))
+        {
+            start += 4096;
+        }
         // SAFETY: a plain CPU-side heap of one view.
         let cpu: ID3D12DescriptorHeap = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {

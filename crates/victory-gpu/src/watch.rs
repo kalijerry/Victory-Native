@@ -3718,7 +3718,18 @@ pub fn title_memory_freed(at: usize, len: usize) {
     }
     let mut g = guards();
     let first = at / BLOCK;
-    let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
+    let opened_first = {
+        let opened = g.opened.lock().unwrap_or_else(|e| e.into_inner());
+        opened.keys().copied().filter(|&b| b >= first).min()
+    };
+    let noted = [
+        g.protected.range(first..).next(),
+        g.absent.range(first..).next(),
+        g.foreign.range(first..).next().copied(),
+        g.aliased.range(first..).next(),
+        BESIDE.set_in(first, usize::MAX).next(),
+        opened_first,
+    ];
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;
     };
@@ -3740,6 +3751,19 @@ pub fn title_memory_freed(at: usize, len: usize) {
     let foreign: Vec<usize> = g.foreign.range(first..end).copied().collect();
     for block in foreign {
         g.foreign.remove(&block);
+    }
+    let aliased: Vec<usize> = g.aliased.range(first..end).collect();
+    for block in aliased {
+        g.aliased.remove(block);
+    }
+    for block in BESIDE.set_in(first, end) {
+        BESIDE.clear(block);
+    }
+    {
+        let mut opened = g.opened.lock().unwrap_or_else(|e| e.into_inner());
+        if !opened.is_empty() {
+            opened.retain(|block, _| !(first..end).contains(block));
+        }
     }
     // (Memory that is still a view is not freed by that call, which fails:
     // it must not stay read-only.)
@@ -3849,9 +3873,18 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
     for block in foreign {
         g.foreign.remove(&block);
     }
-    let aliased: Vec<usize> = g.aliased.range(range).collect();
+    let aliased: Vec<usize> = g.aliased.range(range.clone()).collect();
     for block in aliased {
         g.aliased.remove(block);
+    }
+    for block in BESIDE.set_in(range.start, range.end) {
+        BESIDE.clear(block);
+    }
+    {
+        let mut opened = g.opened.lock().unwrap_or_else(|e| e.into_inner());
+        if !opened.is_empty() {
+            opened.retain(|block, _| !range.contains(block));
+        }
     }
     g
 }
@@ -4018,6 +4051,15 @@ fn writable(at: usize) -> bool {
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 
+/// Serializes tests that exercise the single process-global standing asking
+/// (`ask_once` / `ask_ahead` / `ask_rest` / `ask_once_end`), which the runtime
+/// drives from one submitting thread.
+#[cfg(test)]
+pub(crate) fn lock_standing_asking() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod parts_tests {
     use super::*;
@@ -4106,11 +4148,41 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// Clears stale process-global watch notes left at an address the OS just
+    /// handed to a fresh test allocation.
+    fn forget_test_range(at: usize, len: usize) {
+        let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+        if len == 0 || first >= last {
+            return;
+        }
+        let mut g = guards();
+        for set in [&g.protected, &g.clean, &g.absent, &g.held, &g.aliased] {
+            for block in set.range(first..last).collect::<Vec<_>>() {
+                set.remove(block);
+            }
+        }
+        for block in g.foreign.range(first..last).copied().collect::<Vec<_>>() {
+            g.foreign.remove(&block);
+        }
+        g.opened
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|block, _| !(first..last).contains(block));
+        drop(g);
+        for block in first..last {
+            PUBLISHED.clear(block);
+            PROTECTED.clear(block);
+            BESIDE.clear(block);
+        }
+        forget_views(first, last);
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
         use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
         };
@@ -4125,9 +4197,12 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            CloseHandle(section);
+            view
         };
         assert_ne!(view, 0);
+        forget_test_range(view, 2 * BLOCK);
         assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
@@ -4496,6 +4571,7 @@ mod tests {
             VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
         } as usize;
         assert_ne!(p, 0);
+        let _standing = lock_standing_asking();
         // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
         ask_ahead(&ranges);
@@ -4588,6 +4664,7 @@ mod tests {
             let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
             CloseHandle(section);
             assert!(!view.Value.is_null());
+            forget_test_range(view.Value as usize, SIZE);
             View(view)
         };
         let start = view.0.Value as usize;
@@ -4647,6 +4724,7 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
+            forget_test_range(p, 3 * BLOCK);
             (p, section)
         };
         let map = |block: usize| {
@@ -4739,6 +4817,7 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
+            forget_test_range(p, 3 * BLOCK);
             (p, section)
         };
         let map = |block: usize| {
@@ -4814,6 +4893,8 @@ mod tests {
             let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes).Value as usize;
             assert_ne!(one, 0);
             assert_ne!(two, 0);
+            forget_test_range(one, bytes);
+            forget_test_range(two, bytes);
             crate::inplace::title_memory_view(one, bytes, section as usize, 0);
             crate::inplace::title_memory_view(two, bytes, section as usize, 0);
             (section as usize, one, two)
@@ -4955,6 +5036,13 @@ mod tests {
     /// as written at each asking, at every view of it, until it has rested.
     #[test]
     fn a_block_just_written_rests() {
+        struct ResetRest;
+        impl Drop for ResetRest {
+            fn drop(&mut self) {
+                REST_IN_TEST.set(std::time::Duration::ZERO);
+            }
+        }
+        let _reset = ResetRest;
         let (section, one, two) = two_views(BLOCK);
         let page = one / PAGE;
         let rests = |rests: bool| REST_IN_TEST.set(std::time::Duration::from_secs(if rests { 3600 } else { 0 }));
@@ -5307,6 +5395,228 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    #[test]
+    fn remapping_and_unmapping_clear_beside_and_opened_state() {
+        struct ResetRest;
+        impl Drop for ResetRest {
+            fn drop(&mut self) {
+                REST_IN_TEST.set(std::time::Duration::ZERO);
+            }
+        }
+        let _reset = ResetRest;
+
+        let put = |block: usize, byte: u8| {
+            let started = std::time::Instant::now();
+            loop {
+                // SAFETY: a byte of the view's first page.
+                let done = put_beside(block, 1, |delta| unsafe {
+                    ((block * BLOCK + 100).wrapping_add(delta) as *mut u8).write(byte)
+                });
+                match done {
+                    Beside::Done => return,
+                    Beside::Full => panic!("put_beside unexpectedly returned Full"),
+                    Beside::Cannot => {
+                        assert!(
+                            started.elapsed() < std::time::Duration::from_secs(5),
+                            "put_beside stayed Cannot for 5s"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+        };
+
+        // Part A: BESIDE cleared by title_memory_remapped and title_memory_unmapping.
+        let (section, one, two) = two_views(BLOCK);
+        crate::title_memory_section(section, BLOCK as u64, true);
+        assert!(guard(one, one + BLOCK).is_some());
+        assert!(guard(two, two + BLOCK).is_some());
+        put_count(one / BLOCK).store(0, std::sync::atomic::Ordering::Relaxed);
+        put(one / BLOCK, 0x42);
+        assert!(BESIDE.any(one / BLOCK, one / BLOCK + 1));
+        assert!(BESIDE.any(two / BLOCK, two / BLOCK + 1));
+        title_memory_remapped(one, BLOCK);
+        assert!(!BESIDE.any(one / BLOCK, one / BLOCK + 1));
+        title_memory_unmapping(two, BLOCK);
+        assert!(!BESIDE.any(two / BLOCK, two / BLOCK + 1));
+        drop_views(section, &[one, two], BLOCK);
+        crate::title_memory_section_gone(section);
+
+        // Part B: g.opened cleared by title_memory_remapped and title_memory_unmapping.
+        let (section, one, two) = two_views(BLOCK);
+        REST_IN_TEST.set(std::time::Duration::from_secs(3600));
+        assert!(guard(one, one + BLOCK).is_some());
+        // SAFETY: guarded view, opened by the fault handler.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert!(
+            guards()
+                .opened
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(one / BLOCK))
+        );
+        title_memory_remapped(one, BLOCK);
+        assert!(
+            !guards()
+                .opened
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(one / BLOCK))
+        );
+        assert!(guard(one, one + BLOCK).is_some());
+        assert_eq!(
+            guard(one, one + BLOCK),
+            Some(Vec::new()),
+            "remapped block must not stay resting"
+        );
+
+        assert!(guard(two, two + BLOCK).is_some());
+        // SAFETY: guarded view, opened by the fault handler.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        assert!(
+            guards()
+                .opened
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(two / BLOCK))
+        );
+        title_memory_unmapping(two, BLOCK);
+        assert!(
+            !guards()
+                .opened
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(two / BLOCK))
+        );
+        drop_views(section, &[one, two], BLOCK);
+    }
+
+    #[test]
+    fn freeing_memory_clears_beside_opened_and_aliased_state() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MapViewOfFile3, UnmapViewOfFile2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        // Case 1: len != 0 on an opened-only block (not in protected/absent/foreign).
+        let (section, one, two) = two_views(BLOCK);
+        assert!(guard(one, one + BLOCK).is_some());
+        // SAFETY: guarded view, opened by the fault handler.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert!(
+            guards()
+                .opened
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(one / BLOCK))
+        );
+        title_memory_freed(one, BLOCK);
+        assert!(
+            !guards()
+                .opened
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(one / BLOCK))
+        );
+        drop_views(section, &[one, two], BLOCK);
+
+        // Case 2: len != 0 with BESIDE + g.aliased.
+        let (section, one, two) = two_views(BLOCK);
+        crate::title_memory_section(section, BLOCK as u64, true);
+        assert!(guard(one, one + BLOCK).is_some());
+        assert!(guard(two, two + BLOCK).is_some());
+        put_count(one / BLOCK).store(0, std::sync::atomic::Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        loop {
+            // SAFETY: a byte of the view's first page.
+            let done = put_beside(one / BLOCK, 1, |delta| unsafe {
+                ((one + 100).wrapping_add(delta) as *mut u8).write(0x55)
+            });
+            match done {
+                Beside::Done => break,
+                Beside::Full => panic!("put_beside unexpectedly returned Full"),
+                Beside::Cannot => {
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(5),
+                        "put_beside stayed Cannot for 5s"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        assert!(BESIDE.any(one / BLOCK, one / BLOCK + 1));
+        assert!(guards().aliased.contains(one / BLOCK));
+        title_memory_freed(one, BLOCK);
+        assert!(!BESIDE.any(one / BLOCK, one / BLOCK + 1));
+        assert!(!guards().aliased.contains(one / BLOCK));
+        drop_views(section, &[one, two], BLOCK);
+        crate::title_memory_section_gone(section);
+
+        // Case 3: len == 0 (whole allocation via allocation_end) clears block 0 only.
+        let p = placeholder(2);
+        // SAFETY: replace placeholder block 0 with a 1-block view.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                p as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            CloseHandle(section);
+            (section, view)
+        };
+        let _ = section;
+        assert_eq!(view.Value as usize, p);
+        assert!(guard(p, p + BLOCK).is_some());
+        // SAFETY: guarded view, opened by the fault handler.
+        unsafe { ((p + 8) as *mut u8).write(1) };
+        BESIDE.set(p / BLOCK);
+        guards().aliased.insert(p / BLOCK);
+        BESIDE.set((p + BLOCK) / BLOCK);
+        title_memory_freed(p, 0);
+        assert!(!BESIDE.any(p / BLOCK, p / BLOCK + 1));
+        assert!(!guards().aliased.contains(p / BLOCK));
+        assert!(
+            !guards()
+                .opened
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(p / BLOCK))
+        );
+        assert!(
+            BESIDE.any((p + BLOCK) / BLOCK, (p + BLOCK) / BLOCK + 1),
+            "adjacent allocation must not be cleared"
+        );
+        BESIDE.clear((p + BLOCK) / BLOCK);
+        title_memory_freed(p + BLOCK, BLOCK);
+        // SAFETY: our view and placeholders.
+        unsafe {
+            assert_ne!(
+                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER),
+                0
+            );
+            for block in 0..2 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
     }
 }
 
@@ -6003,6 +6313,7 @@ mod port7_tests {
     /// before asking is told of that write.
     #[test]
     fn no_write_is_lost_with_port_7() {
+        let _standing = super::lock_standing_asking();
         askers_and_a_submission(1);
         askers_and_a_submission(2);
     }
