@@ -1145,6 +1145,17 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Device-removed data is compiled in with `diagnostics` only. Without
+    /// that feature every mode stays off (#25).
+    #[cfg(not(feature = "diagnostics"))]
+    #[test]
+    fn dred_stays_off_without_the_diagnostics_feature() {
+        assert!(!super::dred_on());
+        assert!(!super::dred_light());
+        assert!(!super::dred_faults());
+        assert!(!super::dred_any());
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -1786,11 +1797,35 @@ fn record_twin_copy(
     }
 }
 
+/// Device-removed data (`VICTORY_D3D12_DRED`) is compiled in with the
+/// `diagnostics` feature. A build without it ignores the variable; say so
+/// once, so a release run does not look as if the data were on (#25).
+fn note_dred_without_diagnostics() {
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            if std::env::var_os("VICTORY_D3D12_DRED").is_some() {
+                tracing::warn!(
+                    "VICTORY_D3D12_DRED is set, but this build has no diagnostics feature, so \
+                     device-removed data stays off"
+                );
+            }
+        });
+    }
+}
+
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED") && !dred_faults() && !dred_light())
+    *ON.get_or_init(|| {
+        note_dred_without_diagnostics();
+        cfg!(feature = "diagnostics")
+            && crate::switch::on("VICTORY_D3D12_DRED")
+            && !dred_faults()
+            && !dred_light()
+    })
 }
 
 /// Breadcrumbs and the faulting address, but no markers and no texts
@@ -1800,7 +1835,9 @@ pub(crate) fn dred_on() -> bool {
 pub(crate) fn dred_light() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v == "light")
+        note_dred_without_diagnostics();
+        cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v == "light")
     })
 }
 
@@ -1815,7 +1852,9 @@ pub(crate) fn dred_any() -> bool {
 pub(crate) fn dred_faults() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v == "faults")
+        note_dred_without_diagnostics();
+        cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v == "faults")
     })
 }
 

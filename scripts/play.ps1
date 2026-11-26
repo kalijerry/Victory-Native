@@ -20,11 +20,22 @@ $settings = @{
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
+    # Relay stage 2 and steps on the card are the fast paths with measured breakage (#25).
+    $settings.VICTORY_RELAY = '1'; $settings.VICTORY_CARD_STEPS = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+# Device-removed data is compiled in with the diagnostics feature. The release
+# build does not have it, so the switch stays unset unless -More set it (#25).
+if ($Build -eq 'release') {
+    if ($More.ContainsKey('VICTORY_D3D12_DRED')) {
+        Write-Host "VICTORY_D3D12_DRED is set, but a release build has no diagnostics feature, so device-removed data stays off. Use -Build diag."
+    } else {
+        [void]$settings.Remove('VICTORY_D3D12_DRED')
+    }
+}
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
