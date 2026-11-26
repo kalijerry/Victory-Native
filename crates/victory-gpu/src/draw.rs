@@ -3802,12 +3802,18 @@ impl State {
             let from = v.address + u64::from(first) * stride;
             if v.address == 0
                 || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
+                // Added in 64 bits: in 32 the sum wraps and the check passes.
+                || (u64::from(first) + u64::from(count)) * stride > u64::from(v.size)
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
             }
+            // A vertex buffer view holds at most 4 GiB.
+            let Ok(size) = u32::try_from(rects * 6 * stride) else {
+                once!(slot, "rectangle vertices too many for one view");
+                return false;
+            };
             let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
                 return false;
             };
@@ -3833,7 +3839,7 @@ impl State {
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: size,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
