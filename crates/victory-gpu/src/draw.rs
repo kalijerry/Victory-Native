@@ -97,18 +97,27 @@ impl TableGroup {
     }
 
     fn needs_snapshot(&self, heap: &crate::descriptor::Heap, host_count: u32, table: u64) -> bool {
+        self.past_cap(heap, host_count, table).is_some()
+    }
+
+    /// The table's descriptors that lie past a host heap capped below the
+    /// title's count: those have no title slot of their own and are made
+    /// afresh in the dynamic pool, which on such a heap comes out of the
+    /// title's own slots. None when the table fits.
+    fn past_cap(&self, heap: &crate::descriptor::Heap, host_count: u32, table: u64) -> Option<u32> {
         let index_at = |dword: u32| {
             table
                 .checked_add(u64::from(dword) * 4)
                 .and_then(|end| heap.index(end))
         };
-        match index_at(self.max_dword) {
+        let past = match index_at(self.max_dword) {
             Some(i) => i >= host_count,
             None => self
                 .entries
                 .iter()
                 .any(|u| index_at(u.table_offset_dwords).is_some_and(|i| i >= host_count)),
-        }
+        };
+        past.then_some(self.max_dword / 8 + 1)
     }
 }
 
@@ -3412,14 +3421,25 @@ impl State {
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
             let slot = group.slot;
-            let needs_snapshot = group.has_cbv
-                || match self.roots_ref(compute).get(usize::from(slot)) {
-                    Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
-                        heap.host()
-                            .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
-                    }),
-                    _ => false,
-                };
+            let mut needs_snapshot = group.has_cbv;
+            if !needs_snapshot
+                && let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot))
+                && let Some(heap) = self.heap_of(table)
+                && let Some(host) = heap.host()
+                && let Some(slots) = group.past_cap(heap, host.count(), table)
+            {
+                // (A heap the host capped below the title's count: these are
+                // made afresh in the dynamic pool.)
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::C;
+                    crate::copystat::add(C::TablesPastCap, 1);
+                    crate::copystat::add(C::DyPastCap, 1);
+                    crate::copystat::add(C::DyPastCapSlots, u64::from(slots));
+                }
+                let _ = slots;
+                needs_snapshot = true;
+            }
             if needs_snapshot {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
             }
