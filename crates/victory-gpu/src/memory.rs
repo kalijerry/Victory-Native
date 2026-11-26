@@ -225,7 +225,7 @@ impl Memory {
         let bytes = u64::from(MEMORY_PAGES) * 8;
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
-        let directory = crate::shadow::by_address(entries as u64, bytes)?;
+        let directory = crate::shadow::by_address(entries as u64, bytes, false)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
         let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
@@ -360,7 +360,7 @@ impl Memory {
         // Small title buffers in it: what the builder stores in them comes
         // back, so title memory itself.
         if self.windows < WINDOWS && crate::shadow::small_buffer_in(start, PAGE, BACK) {
-            if let Some(shadow) = crate::shadow::by_address(start, PAGE)
+            if let Some(shadow) = crate::shadow::by_address(start, PAGE, false)
                 && let Some(n) = self.number(shadow)
             {
                 self.windows += 1;
@@ -393,7 +393,7 @@ impl Memory {
         let Some(at) = crate::upload::reserve(ARENA as usize) else {
             return false;
         };
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        let Some(n) = crate::shadow::by_address(at as u64, ARENA, track_arena_writes()).and_then(|s| self.number(s)) else {
             return false;
         };
         self.arenas.push((n, at));
@@ -530,13 +530,21 @@ impl Memory {
             let shadow = &self.copies[held.copy];
             let base = held.at - shadow.span().0 as usize;
             let mut title = [0u8; PIECE];
+            let mut changed_parts = 0;
             for piece in (0..PAGE as usize).step_by(PIECE) {
                 let from = (page * PAGE) as usize + piece;
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
                 // SAFETY: a page of an arena of ours, under the mutex.
                 let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
-                self.stats.changed += merge(&title, ours, never) as u64 * 4;
+                let changed = merge(&title, ours, never);
+                if changed != 0 {
+                    changed_parts |= 1 << (piece / PIECE);
+                }
+                self.stats.changed += changed as u64 * 4;
+            }
+            if shadow.tracks_arena_writes() {
+                crate::watch::wrote_arena_parts(held.at, changed_parts);
             }
             if never {
                 shadow.resend(base, base + PAGE as usize);
@@ -639,6 +647,7 @@ impl Memory {
         let base = held.at - shadow.span().0 as usize;
         let mut title = [0u8; PIECE];
         let mut at = from;
+        let mut changed_parts = 0;
         while at < to {
             let n = (PIECE - at % PIECE).min(to - at);
             crate::host::copy_mapped(title.as_mut_ptr(), (page as usize * PAGE as usize + at) as *const u8, n, false);
@@ -646,9 +655,16 @@ impl Memory {
             let ours = unsafe { std::slice::from_raw_parts_mut((held.at + at) as *mut u8, n) };
             if *ours != title[..n] {
                 ours.copy_from_slice(&title[..n]);
-                crate::watch::wrote(held.at + at, n);
+                if shadow.tracks_arena_writes() {
+                    changed_parts |= 1 << (at / PIECE);
+                } else {
+                    crate::watch::wrote(held.at + at, n);
+                }
             }
             at += n;
+        }
+        if shadow.tracks_arena_writes() {
+            crate::watch::wrote_arena_parts(held.at, changed_parts);
         }
         if whole {
             shadow.resend(base + from, base + to);
@@ -795,6 +811,11 @@ impl Memory {
 
 /// A list with this key ([`HostList::used`]) asks the builder for sizes.
 const SIZES: usize = usize::MAX - (9 << 33);
+
+fn track_arena_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PORT_BVH_ARENA_WRITES"))
+}
 
 /// Whether a submission that asks for the sizes of structures is waited for,
 /// and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=1`; off).

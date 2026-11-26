@@ -1203,6 +1203,29 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// Records which 4 KiB pieces of the private arena page at `at` were written.
+/// Arena refreshes read these notes even outside a submission's asking.
+pub(crate) fn wrote_arena_parts(at: usize, parts: u16) {
+    if parts == 0 {
+        return;
+    }
+    debug_assert!(at.is_multiple_of(PAGE));
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.notes.note(at / PAGE, parts, now);
+}
+
+/// A fresh journal snapshot of a private arena, whose writes are all noted.
+pub(crate) fn arena_writes(start: usize, end: usize) -> (u64, Vec<(usize, u64)>) {
+    journal_writes(start / PAGE, end.div_ceil(PAGE))
+}
+
+fn journal_writes(first: usize, last: usize) -> (u64, Vec<(usize, u64)>) {
+    let j = journal();
+    let held = j.notes.hold(shards_of(first, last), false);
+    (next_asking(), held.range(first, last))
+}
+
 /// The blocks of `[at, at + len)` whose pages the title shows at other
 /// addresses too, and there.
 fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
@@ -1237,7 +1260,10 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 /// pages written since tracking began and the asking that last found each
 /// written, with the number of the asking that stands (as [`writes`] gives
 /// it). `None` if the kernel would have to be asked.
-pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+pub(crate) fn asked(start: usize, end: usize, arena: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    if arena {
+        return Some(arena_writes(start, end));
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
     j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)))
@@ -1257,11 +1283,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // A fresh number and the notes of the range, its parts held meanwhile
     // (renderer port #7, switch or not: who notes shared takes its number
     // holding the parts it notes in).
-    let fresh = || {
-        let j = journal();
-        let held = j.notes.hold(shards_of(first, last), false);
-        (next_asking(), held.range(first, last))
-    };
+    let fresh = || journal_writes(first, last);
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -1366,16 +1388,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64, arena: bool) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
-    let known = published(start, end);
+    let known = !arena && published(start, end);
     #[cfg(feature = "diagnostics")]
     if known {
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.holds(first, last) {
+    if !arena && !known && !j.ahead.holds(first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -4325,6 +4347,55 @@ mod tests {
                 VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
             }
         }
+    }
+
+    #[test]
+    fn arena_writes_are_visible_before_and_after_an_asking() {
+        // SAFETY: fresh private memory, released at the end.
+        let start = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(start, 0);
+        let end = start + 2 * PAGE;
+        let base = start / PAGE;
+        let clear_notes = || {
+            let mut journal = journal_mut();
+            for page in base..base + 2 {
+                let shard = journal.notes.shard_mut(page);
+                shard.written.remove(&page);
+                shard.parts.remove(&page);
+            }
+        };
+        clear_notes();
+        let (initial, notes) = arena_writes(start, end);
+        assert!(notes.is_empty());
+        let mut copied = [initial; 2];
+        assert!(nothing_new(start, end, base, &copied, 0, true));
+
+        wrote_arena_parts(start, 1 << 2);
+        let (taken, notes) = asked(start, end, true).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].0, base);
+        assert!(notes[0].1 > initial);
+        if parts_on() {
+            assert_eq!(parts_written(&[(base, initial)]), [1 << 2]);
+        }
+        assert!(!nothing_new(start, end, base, &copied, 0, true));
+        copied[0] = taken;
+        assert!(nothing_new(start, end, base, &copied, 0, true));
+
+        wrote_arena_parts(start + PAGE, 1 << 1);
+        let (_, notes) = arena_writes(start, end);
+        assert_eq!(notes.len(), 2);
+        assert!(notes[1].1 > taken);
+        if parts_on() {
+            assert_eq!(parts_written(&[(base, taken), (base + 1, initial)]), [0, 1 << 1]);
+        }
+        assert!(!nothing_new(start, end, base, &copied, 0, true));
+
+        clear_notes();
+        // SAFETY: this test owns the allocation.
+        unsafe { VirtualFree(start as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A write between another thread's asking about a range and the second
