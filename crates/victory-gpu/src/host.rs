@@ -10763,7 +10763,8 @@ mod refresh_tests {
     /// refreshes in several flushes, the asking's end.
     fn submission(ranges: &[(Arc<Shadow>, usize, usize)], flushes: usize) {
         // One at a time, as submissions are.
-        let _one = crate::watch::lock_standing_asking();
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let asked: Vec<(usize, usize)> = ranges.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.1 + r.2)).collect();
         crate::watch::ask_once(&asked);
         let mut batch = Batch::default();
@@ -11140,7 +11141,6 @@ mod refresh_tests {
             // Ends in the middle of pages.
             let (at, len) = (region + 500, 5 * PAGE);
             let look = |expected: bool, what: &str| {
-                let _one = crate::watch::lock_standing_asking();
                 // The submission's one asking, which takes two ranges. (Again
                 // if a submission of another test ended it.)
                 let mut known = false;
