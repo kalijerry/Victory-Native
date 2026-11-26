@@ -5,6 +5,9 @@
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Console      series-x (the default) or series-s: the console model the title sees (less memory, lower resolution)
+# -LowMemory    the card reads the game's memory where it is instead of from copies: about 1 GB less RAM, for PCs whose
+#               graphics share their memory (integrated). On a card of its own it reads over PCIe: no slower on Windows
+#               with a 7900 XTX, 2.5 times slower on Linux/Proton (RADV) with one.
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -12,22 +15,26 @@ param(
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
-    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x'
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [switch]$LowMemory
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_RESIDENCY = '1'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
-    # Less memory: buffers the GPU reads where the game has them, windows cut on 1 MiB (run xtx-xcuts: 26.3 GB committed, was 29.3; 49 ms a frame, was 53-58).
-    # Windows cut on 64 KiB fall between the game's unmapped pages and are read in place too, also in its private memory
-    # (run xtx-fine64: copies of game memory 2.1 GB, were 3.3; RAM 19.3 GB, was 20.4; 50 ms a frame)
-    $settings.VICTORY_PORT_ALL = '1'; $settings.VICTORY_WINDOW_KB = '64'; $settings.VICTORY_INPLACE = '1'
+}
+if ($LowMemory) {
+    # Buffers and windows the GPU reads where the game has them, windows cut on 64 KiB so that they fall between the
+    # game's unmapped pages, also in its private memory, and memory let go under pressure. Windows, 7900 XTX, Series X,
+    # at the boat (run xtx-newdefaults): copies of game memory 2.0 GB, were 3.3; RAM 19.4 GB, was 20.4; 50-51 ms a frame.
+    # Linux/Proton (RADV), 7900 XTX: 132.7 ms a frame, was 52.0 (PR #206).
+    $settings.VICTORY_PORT_ALL = '1'; $settings.VICTORY_WINDOW_KB = '64'; $settings.VICTORY_INPLACE = '1'; $settings.VICTORY_RESIDENCY = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
