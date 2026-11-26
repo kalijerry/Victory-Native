@@ -50,6 +50,8 @@ pub(crate) struct Shadow {
     ranged: Mutex<[(usize, usize, u64); 2]>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// Private BVH arena whose CPU writes are all recorded by memory.rs.
+    arena_writes: bool,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -3163,7 +3165,11 @@ impl Shadow {
     /// kernel would refuse (and with it the ranges asked about together).
     pub(crate) fn asked_ahead(&self) -> bool {
         let watched = self.watched.load(Ordering::Relaxed);
-        watched != NOT_WATCHED && (watched != GUARDED || !crate::watch::light())
+        !self.arena_writes && watched != NOT_WATCHED && (watched != GUARDED || !crate::watch::light())
+    }
+
+    pub(crate) fn tracks_arena_writes(&self) -> bool {
+        self.arena_writes
     }
 
     /// The copy's own number (see the field).
@@ -3227,6 +3233,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
+            arena_writes: false,
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3718,7 +3725,7 @@ impl Shadow {
         }
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
+        busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e, self.arena_writes) {
             Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
             None => true,
         })
@@ -3776,7 +3783,7 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some((now, written)) = self.refresh_writes(a, e) else {
                 note_stale(1);
                 return true;
             };
@@ -4040,7 +4047,7 @@ impl Shadow {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to), self.arena_writes);
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4057,11 +4064,18 @@ impl Shadow {
         ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
     }
 
+    fn refresh_writes(&self, from: usize, to: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+        if self.arena_writes {
+            return Some(crate::watch::arena_writes(from, to));
+        }
+        crate::watch::writes(from, to, true)
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some((now, written)) = self.refresh_writes(from, to) {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
@@ -5498,7 +5512,7 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// What shaders write there by address is not brought back, so the copy is
 /// the only place that has it. The CPU's side holds the bytes as they were
 /// last taken, and only dwords that changed since go up.
-pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
+pub(crate) fn by_address(start: u64, len: u64, arena_writes: bool) -> Option<Arc<Shadow>> {
     let host = host()?;
     if !cards() || !host.card_ready() {
         return None;
@@ -5531,6 +5545,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.arena_writes = arena_writes;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,
