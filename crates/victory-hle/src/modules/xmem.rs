@@ -1194,6 +1194,13 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    // A range that wraps the address space is no range: refused before the
+    // page list is read or anything is unmapped. (With 64 KiB pages, a
+    // length that fits also keeps `from_raw_parts` within its limit.)
+    let Some(len) = n.checked_mul(PAGE).filter(|&len| base.checked_add(len).is_some()) else {
+        tracing::warn!(address = base, n, "XMemMapPhysicalPages: a range past the address space");
+        return std::ptr::null_mut();
+    };
     // Read before any lock is taken: a fault in title memory may wait for
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
@@ -1215,7 +1222,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    unmap(&mut physical, base, len);
     let Some(pages) = pages else {
         return address;
     };
