@@ -1836,6 +1836,14 @@ static TEST_BUDGET_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 static TEST_MIP_CLAMP_MODE: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(u32::MAX);
 
+#[cfg(all(windows, test))]
+static TEST_LRU_HEAP_EVICT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+#[cfg(all(windows, test))]
+static TEST_EVICT_MIN_IDLE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
 #[cfg(windows)]
 fn room_raw(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -2610,6 +2618,30 @@ fn lru_evict_enabled() -> bool {
 }
 
 #[cfg(windows)]
+fn parse_lru_heap_evict(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v.trim() == "1")
+}
+
+/// Opt-in gate for unmaking shader-visible `HostHeap` slots during LRU
+/// eviction (`VICTORY_TEXTURE_LRU_HEAP_EVICT=1`, default OFF).
+/// `HostList::stamp_textures()` only stamps barrier-transitioned textures,
+/// missing bindless textures bound once into shader-visible heaps.
+#[cfg(windows)]
+fn lru_heap_evict_enabled() -> bool {
+    #[cfg(test)]
+    match TEST_LRU_HEAP_EVICT.load(std::sync::atomic::Ordering::Acquire) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let raw = std::env::var("VICTORY_TEXTURE_LRU_HEAP_EVICT").ok();
+        parse_lru_heap_evict(raw.as_deref())
+    })
+}
+
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EvictPolicy {
     pub(crate) min_idle_ms: u64,
@@ -2648,7 +2680,9 @@ pub(crate) struct EvictOutcome {
 #[cfg(windows)]
 pub(crate) fn needs_submit_maintenance() -> bool {
     has_unclamped_rebinds()
-        || NEED_HEAP_EVICT.load(std::sync::atomic::Ordering::Acquire)
+        || (lru_evict_enabled()
+            && lru_heap_evict_enabled()
+            && NEED_HEAP_EVICT.load(std::sync::atomic::Ordering::Acquire))
         || (lru_evict_enabled()
             && crate::host::host().is_some_and(|h| !room_raw(h.video_memory())))
 }
@@ -2665,16 +2699,23 @@ pub(crate) fn evict_if_pressured() {
     let Some(host) = crate::host::host() else {
         return;
     };
-    if deferred || !room_raw(host.video_memory()) {
+    let allow_heap_unmake = lru_heap_evict_enabled();
+    if (deferred && allow_heap_unmake) || !room_raw(host.video_memory()) {
+        let policy = EvictPolicy {
+            allow_heap_unmake,
+            #[cfg(test)]
+            min_idle_ms: match TEST_EVICT_MIN_IDLE_MS.load(std::sync::atomic::Ordering::Acquire) {
+                u64::MAX => EvictPolicy::default().min_idle_ms,
+                ms => ms,
+            },
+            ..EvictPolicy::default()
+        };
         let _ = evict_lru_textures_with(
             64 << 20,
             host.completed_fence(),
             host.last_signalled_fence(),
             crate::host::submissions_in_flight(),
-            EvictPolicy {
-                allow_heap_unmake: true,
-                ..EvictPolicy::default()
-            },
+            policy,
         );
     }
 }
@@ -2781,7 +2822,7 @@ pub(crate) fn evict_lru_textures_with(
                     bytes,
                     needs_heap_unmake: true,
                 });
-            } else {
+            } else if lru_heap_evict_enabled() {
                 blocked_on_heaps = true;
             }
         }
@@ -2790,7 +2831,7 @@ pub(crate) fn evict_lru_textures_with(
     if skipped_in_flight > 0 {
         LRU_EVICT_STATS[3].fetch_add(skipped_in_flight, Relaxed);
     }
-    if blocked_on_heaps {
+    if blocked_on_heaps && lru_heap_evict_enabled() {
         NEED_HEAP_EVICT.store(true, Release);
     }
     if candidates.is_empty() {
@@ -2841,7 +2882,7 @@ pub(crate) fn evict_lru_textures_with(
             if unmade_slots > 0 {
                 LRU_EVICT_STATS[2].fetch_add(unmade_slots, Relaxed);
             }
-        } else {
+        } else if lru_heap_evict_enabled() {
             NEED_HEAP_EVICT.store(true, Release);
         }
     }
@@ -5578,6 +5619,8 @@ float4 lit() : SV_Target { return 1.0; }
         fn drop(&mut self) {
             TEST_BUDGET_BYTES.store(0, std::sync::atomic::Ordering::Release);
             TEST_MIP_CLAMP_MODE.store(u32::MAX, std::sync::atomic::Ordering::Release);
+            TEST_LRU_HEAP_EVICT.store(u8::MAX, std::sync::atomic::Ordering::Release);
+            TEST_EVICT_MIN_IDLE_MS.store(u64::MAX, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -5589,6 +5632,17 @@ float4 lit() : SV_Target { return 1.0; }
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
+    }
+
+    #[cfg(windows)]
+    fn host_references_for_test(this: This) -> Option<u32> {
+        resource(this)
+            .host
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(host, _)| crate::host::references(&host.texture))
     }
 
     #[cfg(windows)]
@@ -6444,5 +6498,203 @@ float4 lit() : SV_Target { return 1.0; }
         ensure_unclamped(texture);
         let c3 = host_copy(texture).unwrap();
         assert_eq!(c3.base, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_lru_eviction_never_evicts_host_heap_pinned_bindless_textures() {
+        use std::sync::atomic::Ordering;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        assert!(!parse_lru_heap_evict(None));
+        assert!(!parse_lru_heap_evict(Some("")));
+        assert!(!parse_lru_heap_evict(Some("0")));
+        assert!(!parse_lru_heap_evict(Some("false")));
+        assert!(!parse_lru_heap_evict(Some("off")));
+        assert!(parse_lru_heap_evict(Some("1")));
+        assert!(parse_lru_heap_evict(Some(" 1 ")));
+
+        let _serial = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _knobs = TestKnobsGuard;
+        if std::env::var_os("VICTORY_TEXTURE_LRU_HEAP_EVICT").is_none() {
+            assert!(
+                !lru_heap_evict_enabled(),
+                "VICTORY_TEXTURE_LRU_HEAP_EVICT must default OFF"
+            );
+        }
+        TEST_MIP_CLAMP_MODE.store(0, Ordering::Release);
+        TEST_LRU_HEAP_EVICT.store(0, Ordering::Release);
+        TEST_EVICT_MIN_IDLE_MS.store(0, Ordering::Release);
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        host.with_submit_lock_for_test(|| {
+            let _ = evict_lru_textures_with(
+                u64::MAX >> 2,
+                host.completed_fence(),
+                host.last_signalled_fence(),
+                crate::host::submissions_in_flight(),
+                EvictPolicy {
+                    min_idle_ms: 0,
+                    min_idle_frames: 0,
+                    slot_cooldown_frames: 0,
+                    max_victims: 4096,
+                    allow_heap_unmake: true,
+                },
+            );
+        });
+        crate::frame::advance_for_test(2);
+
+        let null = std::ptr::null();
+        let desc = texture(128, 128, 28, 1);
+        let tex_footprint = footprint(&desc).unwrap().size as usize;
+
+        let make_filled = |fill_byte: u8| -> This {
+            let mut out = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out
+                ),
+                S_OK
+            );
+            // SAFETY: private committed console backing of `tex_footprint` bytes.
+            unsafe {
+                std::ptr::write_bytes(resource(out).data(), fill_byte, tex_footprint);
+            }
+            out
+        };
+
+        let upload_and_wait = |tex: This| {
+            let host_tex = host_resource(tex).expect("host texture");
+            let list = host.new_list().expect("upload list");
+            crate::texture::upload(&list, tex, host_tex);
+            let _ = list.transition(tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32);
+            list.close();
+            host.execute(&[&list]);
+        };
+
+        let heap_desc = crate::descriptor::HeapDesc {
+            kind: 0,
+            count: 32,
+            flags: 1,
+            nodes: 0,
+        };
+        let mut srv_heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                &heap_desc,
+                &PAGEABLE_IIDS[0],
+                &mut srv_heap
+            ),
+            S_OK
+        );
+        let _ = crate::descriptor::heap(srv_heap).host();
+        let cpu_start = crate::descriptor::heap(srv_heap).start;
+
+        // Bindless texture pinned in a shader-visible HostHeap (`refs > 1`).
+        let tex_heap_pinned = make_filled(0x31);
+        upload_and_wait(tex_heap_pinned);
+        crate::descriptor::create_srv(null, tex_heap_pinned, std::ptr::null(), cpu_start);
+        let pinned_bytes = host_copy(tex_heap_pinned).unwrap().bytes;
+        assert!(
+            crate::host::references(&host_copy(tex_heap_pinned).unwrap().texture) >= 2,
+            "shader-visible HostHeap SRV must pin tex_heap_pinned (`refs > 1`)"
+        );
+
+        // Unpinned fence-completed textures (`refs == 1`) created later than `tex_heap_pinned`.
+        crate::frame::advance_for_test(1);
+        let tex_unpinned_a = make_filled(0x52);
+        upload_and_wait(tex_unpinned_a);
+        let unpinned_bytes = host_copy(tex_unpinned_a).unwrap().bytes;
+        assert_eq!(
+            crate::host::references(&host_copy(tex_unpinned_a).unwrap().texture),
+            1
+        );
+
+        crate::frame::advance_for_test(1);
+        let tex_unpinned_b = make_filled(0x63);
+        upload_and_wait(tex_unpinned_b);
+        assert_eq!(
+            crate::host::references(&host_copy(tex_unpinned_b).unwrap().texture),
+            1
+        );
+
+        crate::frame::advance_for_test(5);
+        let current_filled = KINDS[1].load(Ordering::Relaxed);
+        let tight_cap = current_filled
+            .saturating_sub(2 * unpinned_bytes + pinned_bytes / 2)
+            .max(1);
+        TEST_BUDGET_BYTES.store(tight_cap, Ordering::Release);
+        NEED_HEAP_EVICT.store(false, Ordering::Release);
+        assert!(!room_raw(None), "budget cap must report pressured");
+
+        // 1. Direct default `allow_heap_unmake: false` never evicts `refs > 1`, evicts `refs == 1`,
+        // and never arms `NEED_HEAP_EVICT` when `!lru_heap_evict_enabled()`.
+        let outcome = host.with_submit_lock_for_test(|| {
+            evict_lru_textures_with(
+                unpinned_bytes,
+                host.completed_fence(),
+                host.last_signalled_fence(),
+                crate::host::submissions_in_flight(),
+                EvictPolicy {
+                    min_idle_ms: 0,
+                    min_idle_frames: 4,
+                    slot_cooldown_frames: 60,
+                    max_victims: 8,
+                    allow_heap_unmake: false,
+                },
+            )
+        });
+        assert_eq!(outcome.evicted_count, 1, "must evict only unpinned refs==1");
+        assert_eq!(outcome.unmade_slots, 0, "must never unmake HostHeap slots");
+        assert!(!is_resident_for_test(tex_unpinned_a));
+        assert!(is_resident_for_test(tex_unpinned_b));
+        assert!(
+            is_resident_for_test(tex_heap_pinned),
+            "live HostHeap-pinned texture must never be evicted under allow_heap_unmake: false"
+        );
+        assert!(
+            host_references_for_test(tex_heap_pinned).is_some_and(|refs| refs >= 2),
+            "HostHeap slot must remain made and pinned"
+        );
+        assert!(
+            !NEED_HEAP_EVICT.load(Ordering::Acquire),
+            "NEED_HEAP_EVICT must stay false when VICTORY_TEXTURE_LRU_HEAP_EVICT is off"
+        );
+
+        // 2. `evict_if_pressured()` under default OFF still skips `refs > 1` while evicting `refs == 1`.
+        host.with_submit_lock_for_test(evict_if_pressured);
+        assert!(!is_resident_for_test(tex_unpinned_b));
+        assert!(
+            is_resident_for_test(tex_heap_pinned),
+            "evict_if_pressured() must never evict HostHeap-pinned textures by default"
+        );
+        assert!(
+            host_references_for_test(tex_heap_pinned).is_some_and(|refs| refs >= 2),
+            "HostHeap slot must remain pinned after default evict_if_pressured()"
+        );
+        assert!(!NEED_HEAP_EVICT.load(Ordering::Acquire));
+
+        // 3. Explicit opt-in `VICTORY_TEXTURE_LRU_HEAP_EVICT=1` restores `HostHeap` eviction.
+        TEST_LRU_HEAP_EVICT.store(1, Ordering::Release);
+        host.with_submit_lock_for_test(evict_if_pressured);
+        assert!(
+            !is_resident_for_test(tex_heap_pinned),
+            "opt-in VICTORY_TEXTURE_LRU_HEAP_EVICT=1 must allow evict_if_pressured() to unmake and evict HostHeap texture"
+        );
+
+        assert_eq!(slot::<Release>(tex_unpinned_b, 0x10)(tex_unpinned_b), 0);
+        assert_eq!(slot::<Release>(tex_unpinned_a, 0x10)(tex_unpinned_a), 0);
+        assert_eq!(slot::<Release>(tex_heap_pinned, 0x10)(tex_heap_pinned), 0);
+        assert_eq!(slot::<Release>(srv_heap, 0x10)(srv_heap), 0);
     }
 }

@@ -5714,6 +5714,7 @@ impl Host {
             0 => crate::descriptor::begin_sync_heaps(),
             mark => crate::descriptor::begin_sync_heaps_after(mark),
         });
+        let mut heaps_waited_ns = 0u64;
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -5754,7 +5755,9 @@ impl Host {
         if !behind && crate::resource::needs_submit_maintenance() {
             // Join any background `victory-heap-sync` pass before mutating
             // `HostHeap` slots in `evict_if_pressured()`.
+            let heaps_began = std::time::Instant::now();
             heaps_synced.take();
+            heaps_waited_ns += heaps_began.elapsed().as_nanos() as u64;
             crate::resource::evict_if_pressured();
         }
         stage.next("submit: gathering what to ask about");
@@ -5909,7 +5912,10 @@ impl Host {
         stage.next("submit: waiting for the heaps' records");
         let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
-        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        crate::port_journal::heaps_waited(
+            heaps_waited_ns.saturating_add(heaps_began.elapsed().as_nanos() as u64),
+            heaps_on,
+        );
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
