@@ -170,6 +170,15 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// Slots where `keep_views()` intentionally kept an older texture while a
+    /// newer waiting view queued: `(slot_index -> expected_made_key)`.
+    keeping: Mutex<std::collections::HashMap<u32, u64>>,
+    /// Lock-free bitmap mirroring `keeping` for the `HostHeap::mirror` hot path.
+    keeping_bits: Box<[std::sync::atomic::AtomicU64]>,
+    /// Approximate count of slots in `keeping` to short-circuit `yield_kept_views`.
+    keeping_count: std::sync::atomic::AtomicUsize,
+    /// Frame number when each slot was last bound or mirrored for draw (`Tier 3`).
+    last_used_frame: Box<[std::sync::atomic::AtomicU64]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1651,6 +1660,16 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::AcqRel;
+        let count = self.keeping_count.swap(0, AcqRel);
+        if count > 0 {
+            KEEPING_SLOTS_TOTAL.fetch_sub(count, AcqRel);
+        }
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1776,6 +1795,14 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            keeping: Mutex::new(std::collections::HashMap::new()),
+            keeping_bits: (0..(count + extra).div_ceil(64))
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            keeping_count: std::sync::atomic::AtomicUsize::new(0),
+            last_used_frame: (0..count + extra)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2352,6 +2379,7 @@ impl HostHeap {
     /// until then it shows what it showed. (Made at once, the frames on the
     /// card read the new view before its levels were filled.)
     pub(crate) fn texture_slot_flip(&self, list: &crate::host::HostList, index: u32, handle: u64) {
+        self.clear_keeping(index);
         self.flip(list, index, handle, None);
     }
 
@@ -2553,6 +2581,7 @@ impl HostHeap {
     /// any raw `ID3D12Resource` pointer in `victims`, appending removed COM
     /// references to `removed` so the caller drops/retires them outside all
     /// locks. Call only when no GPU submission is in flight.
+    #[cfg(test)]
     pub(crate) fn evict_kept(
         &self,
         victims: &std::collections::HashSet<usize>,
@@ -2561,17 +2590,56 @@ impl HostHeap {
         removed: &mut Vec<ID3D12Resource>,
         shader_slots: &mut Vec<(usize, u32)>,
     ) -> usize {
+        self.evict_kept_with(victims, frame, cooldown_frames, 0, removed, shader_slots)
+    }
+
+    /// [`Self::evict_kept`] enforcing a per-slot `min_idle_frames` recency
+    /// guard and evicting oldest `last_used_frame` slots first.
+    pub(crate) fn evict_kept_with(
+        &self,
+        victims: &std::collections::HashSet<usize>,
+        frame: u64,
+        cooldown_frames: u64,
+        min_idle_frames: u64,
+        removed: &mut Vec<ID3D12Resource>,
+        shader_slots: &mut Vec<(usize, u32)>,
+    ) -> usize {
         use windows::core::Interface;
         if self.sampler || victims.is_empty() {
             return 0;
         }
         let mut unmade = 0usize;
-        let mut evicted_title: Vec<(u32, u64)> = Vec::new();
+        let mut candidates: Vec<(u64, u32)> = Vec::new();
         for index in 0..self.count {
             if self.made.get(index).unwrap_or(0) == 0 {
                 continue;
             }
+            let last_used = self.slot_last_used_frame(index);
+            if min_idle_frames > 0 && frame.saturating_sub(last_used) < min_idle_frames {
+                continue;
+            }
+            let Some(slot) = self.kept.get(index as usize) else {
+                continue;
+            };
+            let slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot
+                .as_ref()
+                .is_some_and(|res| victims.contains(&(res.as_raw() as usize)))
+            {
+                candidates.push((last_used, index));
+            }
+        }
+        candidates.sort_unstable();
+        let mut evicted_title: Vec<(u32, u64)> = Vec::new();
+        for (_, index) in candidates {
+            if self.made.get(index).unwrap_or(0) == 0 {
+                continue;
+            }
             let _made = self.made.lock(index);
+            let last_used = self.slot_last_used_frame(index);
+            if min_idle_frames > 0 && frame.saturating_sub(last_used) < min_idle_frames {
+                continue;
+            }
             let matches = {
                 let Some(slot) = self.kept.get(index as usize) else {
                     continue;
@@ -2586,6 +2654,8 @@ impl HostHeap {
             // Clear `quick` and `made` (`Release`) BEFORE taking `slot` or
             // writing the null view so lock-free `mirror` readers fall through
             // to `self.made` and serialize after this unmake.
+            self.clear_keeping(index);
+            self.note_slot_used(index, 0);
             self.quick_is(index, 0);
             let key = self.made.get(index).unwrap_or(0);
             self.made.set(index, 0);
@@ -2638,11 +2708,33 @@ impl HostHeap {
         }
         if self.dynamic > 0 {
             let guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            let mut dyn_candidates: Vec<(u64, u32)> = Vec::new();
             for dyn_idx in 0..self.dynamic as usize {
                 if guard.1.get(dyn_idx).copied().unwrap_or(true) {
                     continue;
                 }
                 let index = self.count + dyn_idx as u32;
+                let last_used = self.slot_last_used_frame(index);
+                if min_idle_frames > 0 && frame.saturating_sub(last_used) < min_idle_frames {
+                    continue;
+                }
+                let Some(slot) = self.kept.get(index as usize) else {
+                    continue;
+                };
+                let slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+                if slot
+                    .as_ref()
+                    .is_some_and(|res| victims.contains(&(res.as_raw() as usize)))
+                {
+                    dyn_candidates.push((last_used, index));
+                }
+            }
+            dyn_candidates.sort_unstable();
+            for (_, index) in dyn_candidates {
+                let last_used = self.slot_last_used_frame(index);
+                if min_idle_frames > 0 && frame.saturating_sub(last_used) < min_idle_frames {
+                    continue;
+                }
                 let old = {
                     let Some(slot) = self.kept.get(index as usize) else {
                         continue;
@@ -2658,6 +2750,7 @@ impl HostHeap {
                     }
                 };
                 if let Some(old) = old {
+                    self.note_slot_used(index, 0);
                     null_view(self.at(index));
                     self.put(index);
                     self.clear_twin(index);
@@ -2669,9 +2762,167 @@ impl HostHeap {
         unmade
     }
 
+    /// Stamps `frame` as the most recent draw/bind frame for descriptor `index`
+    /// (`frame == 0` clears the timestamp on unmake).
+    pub(crate) fn note_slot_used(&self, index: u32, frame: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(slot) = self.last_used_frame.get(index as usize)
+            && slot.load(Relaxed) != frame
+        {
+            slot.store(frame, Relaxed);
+        }
+    }
+
+    /// Returns the last frame when descriptor slot `index` was bound or drawn
+    /// (`0` if unmade or never recorded).
+    pub(crate) fn slot_last_used_frame(&self, index: u32) -> u64 {
+        self.last_used_frame
+            .get(index as usize)
+            .map_or(0, |slot| slot.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn set_keeping(&self, index: u32, expected_key: u64) {
+        if expected_key == 0 || !kept_views_yield() {
+            return;
+        }
+        let slot_bit = 1u64 << (index & 63);
+        let mut keeping = self.keeping.lock().unwrap_or_else(|e| e.into_inner());
+        if keeping.insert(index, expected_key).is_none() {
+            self.keeping_count
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            KEEPING_SLOTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(word) = self.keeping_bits.get(index as usize >> 6) {
+            word.fetch_or(slot_bit, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn clear_keeping(&self, index: u32) {
+        let slot_bit = 1u64 << (index & 63);
+        if let Some(word) = self.keeping_bits.get(index as usize >> 6)
+            && word.load(std::sync::atomic::Ordering::Acquire) & slot_bit == 0
+        {
+            return;
+        }
+        let mut keeping = self.keeping.lock().unwrap_or_else(|e| e.into_inner());
+        if keeping.remove(&index).is_some() {
+            self.keeping_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+            KEEPING_SLOTS_TOTAL.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(word) = self.keeping_bits.get(index as usize >> 6) {
+            word.fetch_and(!slot_bit, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn yield_kept_views(&self) -> usize {
+        let mut removed = Vec::new();
+        let unmade = self.yield_kept_views_into(&mut removed);
+        release_yielded_resources(removed);
+        unmade
+    }
+
+    /// Unmakes superseded `keeping` slots under per-slot `made` locks and
+    /// appends their old COM references to `removed` for release outside locks.
+    pub(crate) fn yield_kept_views_into(&self, removed: &mut Vec<ID3D12Resource>) -> usize {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        if self.sampler || !kept_views_yield() || self.keeping_count.load(Acquire) == 0 {
+            return 0;
+        }
+        // Snapshot candidates without clearing `keeping`, then verify & remove each
+        // slot under `made.lock(index) -> keeping` (`keeping` stays a leaf lock)
+        // so concurrent `mirror` fast-path clears are never overridden.
+        let mut slots: Vec<(u32, u64)> = {
+            let keeping = self.keeping.lock().unwrap_or_else(|e| e.into_inner());
+            if keeping.is_empty() {
+                return 0;
+            }
+            keeping.iter().map(|(&idx, &key)| (idx, key)).collect()
+        };
+        slots.sort_unstable_by_key(|&(index, _)| index);
+        let mut unmade = 0usize;
+        for (index, expected_key) in slots {
+            let _made = self.made.lock(index);
+            if self.made.get(index) != Some(expected_key) {
+                continue;
+            }
+            {
+                let mut keeping = self.keeping.lock().unwrap_or_else(|e| e.into_inner());
+                if keeping.get(&index).copied() != Some(expected_key) {
+                    continue;
+                }
+                keeping.remove(&index);
+                self.keeping_count.fetch_sub(1, Release);
+                KEEPING_SLOTS_TOTAL.fetch_sub(1, Release);
+                if let Some(word) = self.keeping_bits.get(index as usize >> 6) {
+                    word.fetch_and(!(1u64 << (index & 63)), Release);
+                }
+            }
+            self.quick_is(index, 0);
+            self.made.set(index, 0);
+            self.note_slot_used(index, 0);
+            if let Some(piece) = self.kept.get(index as usize) {
+                let old = piece.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(old) = old {
+                    removed.push(old);
+                }
+            }
+            match view_at(expected_key as u32, (expected_key >> 32) as u32) {
+                Some(view) => null_for(&view, self.at(index)),
+                None => null_view(self.at(index)),
+            }
+            self.put(index);
+            self.clear_twin(index);
+            unmade += 1;
+        }
+        unmade
+    }
+
+    /// Collects recency (`max last_used_frame`), hot/taken-dynamic protection,
+    /// and exact `kept_refs` per raw `ID3D12Resource` pinned in `kept`.
+    pub(crate) fn collect_resource_recency(
+        &self,
+        frame: u64,
+        min_idle_frames: u64,
+        out: &mut std::collections::HashMap<usize, HeapResourceRecency>,
+    ) {
+        use windows::core::Interface;
+        if self.sampler {
+            return;
+        }
+        let dyn_taken: Vec<bool> = if self.dynamic > 0 {
+            self.next.lock().unwrap_or_else(|e| e.into_inner()).1.clone()
+        } else {
+            Vec::new()
+        };
+        for (idx, piece) in self.kept.iter().enumerate() {
+            let raw = {
+                let guard = piece.lock().unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().map(|res| res.as_raw() as usize)
+            };
+            let Some(raw) = raw else {
+                continue;
+            };
+            let taken = idx >= self.count as usize
+                && dyn_taken
+                    .get(idx - self.count as usize)
+                    .copied()
+                    .unwrap_or(true);
+            let last_used = self.slot_last_used_frame(idx as u32);
+            let hot = min_idle_frames > 0 && frame.saturating_sub(last_used) < min_idle_frames;
+            let entry = out.entry(raw).or_default();
+            entry.max_last_used_frame = entry.max_last_used_frame.max(last_used);
+            entry.protected |= taken || hot;
+            entry.kept_refs = entry.kept_refs.saturating_add(1);
+        }
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held. Under its lock ([`Made`]).
     fn unmake(&self, index: u32) {
+        self.clear_keeping(index);
+        self.note_slot_used(index, 0);
         self.quick_is(index, 0);
         let Some(key) = self.made.get(index) else {
             return;
@@ -3052,6 +3303,15 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.clear_keeping(index);
+        self.note_slot_used(
+            index,
+            if resource.is_some() {
+                crate::frame::current().max(1)
+            } else {
+                0
+            },
+        );
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -3430,6 +3690,10 @@ impl HostHeap {
             && self.quick.get(index as usize).is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key)
             && let Some(view) = view_at(i, generation)
         {
+            self.clear_keeping(index);
+            if for_draw {
+                self.note_slot_used(index, crate::frame::current().max(1));
+            }
             return Some(view);
         }
         let held = self.made.lock(index);
@@ -3444,6 +3708,7 @@ impl HostHeap {
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
+                self.clear_keeping(index);
                 // Left for later and stale since: out of the sets and the stride table.
                 let _ = self.note_buffer(index, None, false);
             }
@@ -3478,6 +3743,7 @@ impl HostHeap {
                 let kin = kin(&old, &view);
                 if kin == Kin::Same {
                     KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.set_keeping(index, shown);
                     drop(held);
                     self.unmake_stale(index, stale);
                     return Some(view);
@@ -3489,6 +3755,7 @@ impl HostHeap {
                     let kept = kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
+                        self.set_keeping(index, shown);
                         drop(held);
                         self.unmake_stale(index, stale);
                         return Some(view);
@@ -3558,6 +3825,11 @@ impl HostHeap {
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
+        } else {
+            self.clear_keeping(index);
+            if for_draw {
+                self.note_slot_used(index, crate::frame::current().max(1));
+            }
         }
         Some(view)
     }
@@ -4766,6 +5038,69 @@ pub(crate) fn adjust_srv_for_base_mip(
 #[cfg(test)]
 fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
     adjust_srv_for_base_mip(desc, base, 16);
+}
+
+/// Whether slots where `keep_views()` held an older texture yield under VRAM
+/// pressure; `VICTORY_KEPT_VIEWS_YIELD=0` disables yielding (default ON).
+#[cfg(test)]
+pub(crate) static TEST_KEPT_VIEWS_YIELD: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+static KEEPING_SLOTS_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn keeping_total() -> usize {
+    KEEPING_SLOTS_TOTAL.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn parse_kept_views_yield(val: Option<&str>) -> bool {
+    !matches!(val.map(str::trim), Some("0"))
+}
+
+pub(crate) fn kept_views_yield() -> bool {
+    #[cfg(test)]
+    match TEST_KEPT_VIEWS_YIELD.load(std::sync::atomic::Ordering::Acquire) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let val = std::env::var("VICTORY_KEPT_VIEWS_YIELD").ok();
+        parse_kept_views_yield(val.as_deref())
+    })
+}
+
+/// Per-resource recency snapshot collected from live shader heaps for Tier 3
+/// oldest-`last_used_frame` eviction ordering, `min_idle_frames` protection,
+/// and exact `kept_refs` accounting.
+#[derive(Default)]
+pub(crate) struct HeapResourceRecency {
+    pub(crate) max_last_used_frame: u64,
+    pub(crate) protected: bool,
+    pub(crate) kept_refs: u32,
+}
+
+/// Releases displaced heap COM references outside locks: when the GPU queue is
+/// idle and `Hosted::made` still owns ref #1 (`references > 1`), drops
+/// synchronously outside `bury_lag()` so Pass 2 sees `references == 1`.
+pub(crate) fn release_yielded_resources(removed: Vec<ID3D12Resource>) {
+    if removed.is_empty() {
+        return;
+    }
+    let idle = crate::host::submissions_in_flight() == 0;
+    for old in removed {
+        if idle && crate::host::references(&old) > 1 {
+            drop(old);
+        } else {
+            crate::host::retire_resource(old);
+        }
+    }
+}
+
+/// Yields superseded `keep_views` slots across all live shader heaps.
+pub(crate) fn yield_kept_views() -> usize {
+    super::yield_kept_views()
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -6586,5 +6921,512 @@ mod mip_clamp_and_evict_kept_tests {
         assert!(heap.texture_slots_due(101, 16).0.is_empty());
         assert!(heap.texture_slots_due(339, 16).0.is_empty());
         assert_eq!(heap.texture_slots_due(340, 16).0.len(), 1);
+    }
+
+    #[test]
+    fn keeping_tracks_superseded_views_and_yield_kept_views_frees_only_superseded_slots() {
+        use std::sync::atomic::Ordering::Release;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let tex_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 4,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let make_tex = || -> ID3D12Resource {
+            let mut out: Option<ID3D12Resource> = None;
+            // SAFETY: valid D3D12 device and default texture description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &props,
+                        D3D12_HEAP_FLAG_NONE,
+                        &tex_desc,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        None,
+                        &mut out,
+                    )
+                    .unwrap();
+            }
+            out.unwrap()
+        };
+        let tex_superseded = make_tex();
+        let tex_live = make_tex();
+        let tex_resolved_init = make_tex();
+        let tex_resolved = make_tex();
+
+        let mem = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!mem.is_null());
+        let handle = |slot: usize| mem as u64 + (slot as u64) * 32;
+
+        let mut res_a = [0u32; 14];
+        res_a[0] = 3;
+        res_a[4] = 16;
+        res_a[6] = 16;
+        res_a[7] = (4 << 16) | 1;
+        res_a[8] = 28;
+        res_a[9] = 1;
+        let mut desc_low = [0u32; 16];
+        (desc_low[0], desc_low[1], desc_low[2], desc_low[4], desc_low[5], desc_low[10], desc_low[11]) =
+            (28, 4, 5768, 2, 2, 0x2000_0000, 0xb);
+        let mut desc_high = desc_low;
+        (desc_high[4], desc_high[5]) = (0, 4);
+
+        let [vi_low, vg_low] = super::super::words_for(View::Placed(false, res_a, desc_low));
+        let key_low = u64::from(vg_low) << 32 | u64::from(vi_low);
+        {
+            let _made = heap.made.lock(2);
+            heap.made.set(2, key_low);
+            heap.quick_is(2, key_low);
+        }
+        heap.keep(2, Some(tex_superseded.clone()));
+
+        let [vi_high, vg_high] = super::super::words_for(View::Placed(false, res_a, desc_high));
+        unsafe {
+            (handle(2) as *mut [u32; 3]).write_unaligned([VIEW_TAG, vi_high, vg_high]);
+        }
+        assert!(heap.mirror(2, handle(2), false).is_some());
+        assert!(heap.made(2), "keep_views must keep older view made while newer queues");
+        assert_eq!(crate::host::references(&tex_superseded), 2);
+
+        let mut res_b = res_a;
+        res_b[4] = 128;
+        let [vi_live, vg_live] = super::super::words_for(View::Placed(false, res_b, desc_low));
+        let key_live = u64::from(vg_live) << 32 | u64::from(vi_live);
+        {
+            let _made = heap.made.lock(3);
+            heap.made.set(3, key_live);
+            heap.quick_is(3, key_live);
+        }
+        heap.keep(3, Some(tex_live.clone()));
+
+        {
+            let _made = heap.made.lock(4);
+            heap.made.set(4, key_low);
+            heap.quick_is(4, key_low);
+        }
+        heap.keep(4, Some(tex_resolved_init));
+        unsafe {
+            (handle(4) as *mut [u32; 3]).write_unaligned([VIEW_TAG, vi_high, vg_high]);
+        }
+        assert!(heap.mirror(4, handle(4), false).is_some());
+        heap.keep(4, Some(tex_resolved.clone()));
+
+        TEST_KEPT_VIEWS_YIELD.store(0, Release);
+        assert_eq!(heap.yield_kept_views(), 0);
+        assert!(heap.made(2));
+
+        TEST_KEPT_VIEWS_YIELD.store(1, Release);
+        assert_eq!(heap.yield_kept_views(), 1);
+        assert!(!heap.made(2), "superseded slot 2 must be unmade");
+        assert!(heap.made(3), "live non-superseded slot 3 must remain made");
+        assert!(heap.made(4), "resolved slot 4 must remain made");
+        assert_eq!(crate::host::references(&tex_superseded), 1);
+        assert_eq!(crate::host::references(&tex_live), 2);
+        assert_eq!(crate::host::references(&tex_resolved), 2);
+        assert_eq!(heap.yield_kept_views(), 0);
+
+        TEST_KEPT_VIEWS_YIELD.store(u8::MAX, Release);
+        unsafe {
+            let _ = VirtualFree(mem, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn evict_kept_with_enforces_idle_frames_and_evicts_oldest_last_used_frame_first() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        use windows::core::Interface;
+
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let make_tex = || -> ID3D12Resource {
+            let mut out: Option<ID3D12Resource> = None;
+            // SAFETY: valid D3D12 device and default texture description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &props,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        None,
+                        &mut out,
+                    )
+                    .unwrap();
+            }
+            out.unwrap()
+        };
+        let tex_old = make_tex();
+        let tex_mid = make_tex();
+        let tex_hot = make_tex();
+
+        for (slot, (res, used_at)) in [(&tex_old, 10u64), (&tex_mid, 50u64), (&tex_hot, 150u64)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut placed = [0u32; 14];
+            placed[0] = 3;
+            placed[4] = 16 + slot as u32;
+            let [vi, vg] = super::super::words_for(View::Placed(false, placed, [0u32; 16]));
+            let key = u64::from(vg) << 32 | u64::from(vi);
+            {
+                let _made = heap.made.lock(slot as u32);
+                heap.made.set(slot as u32, key);
+                heap.quick_is(slot as u32, key);
+            }
+            heap.keep(slot as u32, Some(res.clone()));
+            heap.note_slot_used(slot as u32, used_at);
+        }
+
+        let victims: std::collections::HashSet<usize> = [
+            tex_old.as_raw() as usize,
+            tex_mid.as_raw() as usize,
+            tex_hot.as_raw() as usize,
+        ]
+        .into_iter()
+        .collect();
+        let mut removed = Vec::new();
+        let mut shader_slots = Vec::new();
+        assert_eq!(
+            heap.evict_kept_with(&victims, 200, 30, 120, &mut removed, &mut shader_slots),
+            2
+        );
+        assert_eq!(removed.len(), 2);
+        assert_eq!(removed[0].as_raw(), tex_old.as_raw());
+        assert_eq!(removed[1].as_raw(), tex_mid.as_raw());
+        assert!(!heap.made(0));
+        assert!(!heap.made(1));
+        assert!(heap.made(2), "hot slot within 120 frames must be protected");
+        drop(removed);
+        assert_eq!(crate::host::references(&tex_old), 1);
+        assert_eq!(crate::host::references(&tex_mid), 1);
+        assert_eq!(crate::host::references(&tex_hot), 2);
+    }
+
+    static TEST_KEEPING_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn drop_host_heap_subtracts_active_keeping_from_keeping_slots_total() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let _serial = TEST_KEEPING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let tex_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 4,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut out: Option<ID3D12Resource> = None;
+        // SAFETY: valid D3D12 device and texture description.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &tex_desc,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    None,
+                    &mut out,
+                )
+                .unwrap();
+        }
+        let tex = out.unwrap();
+        let mem = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!mem.is_null());
+
+        let res_a = [3u32, 0, 0, 0, 16, 0, 16, (4 << 16) | 1, 28, 1, 0, 0, 0, 0];
+        let mut desc_low = [0u32; 16];
+        (desc_low[0], desc_low[1], desc_low[2], desc_low[4], desc_low[5], desc_low[10], desc_low[11]) =
+            (28, 4, 5768, 2, 2, 0x2000_0000, 0xb);
+        let mut desc_high = desc_low;
+        (desc_high[4], desc_high[5]) = (0, 4);
+
+        let [vi_low, vg_low] = super::super::words_for(View::Placed(false, res_a, desc_low));
+        let key_low = u64::from(vg_low) << 32 | u64::from(vi_low);
+        {
+            let _made = heap.made.lock(1);
+            heap.made.set(1, key_low);
+            heap.quick_is(1, key_low);
+        }
+        heap.keep(1, Some(tex));
+
+        let [vi_high, vg_high] = super::super::words_for(View::Placed(false, res_a, desc_high));
+        unsafe {
+            (mem as *mut [u32; 3]).write_unaligned([VIEW_TAG, vi_high, vg_high]);
+        }
+        let before = keeping_total();
+        assert!(heap.mirror(1, mem as u64, false).is_some());
+        assert_eq!(keeping_total(), before + 1);
+        drop(heap);
+        assert_eq!(keeping_total(), before, "HostHeap::drop must subtract active keeping slots from KEEPING_SLOTS_TOTAL");
+
+        unsafe {
+            let _ = VirtualFree(mem, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn texture_slot_flip_clears_keeping_so_yield_does_not_abandon_flip() {
+        use std::sync::atomic::Ordering::Release;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let _serial = TEST_KEEPING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+
+        let placed_res = [3u32, 0, 0, 0, 64, 0, 64, (4 << 16) | 1, 28, 1, 0, 0, 0, 0];
+        let placed_len = crate::resource::placed_bytes(&placed_res).unwrap() as usize;
+        let alloc_stride = (placed_len + 0xfff) & !0xfff;
+        let placed_mem = unsafe {
+            VirtualAlloc(std::ptr::null(), alloc_stride, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!placed_mem.is_null());
+        unsafe {
+            std::ptr::write_bytes(placed_mem.cast::<u8>(), 0x55, alloc_stride);
+        }
+        let addr = placed_mem as u64;
+        let mut desc_low = [0u32; 16];
+        (desc_low[0], desc_low[1], desc_low[2], desc_low[4], desc_low[5], desc_low[10], desc_low[11]) =
+            (28, 4, 5768, 2, 2, addr as u32, (addr >> 32) as u32);
+        let mut desc_high = desc_low;
+        (desc_high[4], desc_high[5]) = (0, 4);
+
+        let handle_mem = unsafe {
+            VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!handle_mem.is_null());
+        let handle = handle_mem as u64;
+
+        crate::descriptor::create_placed_srv(std::ptr::null(), &placed_res, &desc_low, handle);
+        assert!(heap.mirror(0, handle, true).is_some());
+        assert!(heap.made(0));
+
+        let before = keeping_total();
+        crate::descriptor::create_placed_srv(std::ptr::null(), &placed_res, &desc_high, handle);
+        assert!(heap.mirror(0, handle, false).is_some());
+        assert_eq!(keeping_total(), before + 1);
+
+        let list = host.new_list().expect("flip list");
+        heap.texture_slot_flip(&list, 0, handle);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(keeping_total(), before, "texture_slot_flip must clear keeping immediately");
+
+        TEST_KEPT_VIEWS_YIELD.store(1, Release);
+        assert_eq!(heap.yield_kept_views(), 0, "yield must not unmake a slot queued for texture_slot_flip");
+        assert!(heap.made(0));
+        assert_eq!(heap.texture_slots_flip(), 1, "queued flip must complete cleanly");
+        assert!(heap.made(0));
+
+        TEST_KEPT_VIEWS_YIELD.store(u8::MAX, Release);
+        drop(heap);
+        crate::resource::release_test_placed_texture(addr, placed_res);
+        unsafe {
+            let _ = VirtualFree(handle_mem, 0, MEM_RELEASE);
+            let _ = VirtualFree(placed_mem, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn collect_resource_recency_counts_kept_refs_protects_taken_dynamic_and_frame_zero_slots() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let make_tex = || -> ID3D12Resource {
+            let mut out: Option<ID3D12Resource> = None;
+            // SAFETY: valid D3D12 device and default texture description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &props,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        None,
+                        &mut out,
+                    )
+                    .unwrap();
+            }
+            out.unwrap()
+        };
+
+        let tex_taken = make_tex();
+        let tex_dyn_cold_first = make_tex();
+        let tex_dyn_cold_second = make_tex();
+        let tex_frame_zero = make_tex();
+
+        let mut placed = [0u32; 14];
+        placed[0] = 3;
+        placed[4] = 16;
+        let [vi, vg] = super::super::words_for(View::Placed(false, placed, [0u32; 16]));
+        let key = u64::from(vg) << 32 | u64::from(vi);
+        {
+            let _m0 = heap.made.lock(0);
+            heap.made.set(0, key);
+            heap.quick_is(0, key);
+            let _m1 = heap.made.lock(1);
+            heap.made.set(1, key);
+            heap.quick_is(1, key);
+        }
+        heap.keep(0, Some(tex_taken.clone()));
+        heap.note_slot_used(0, 10);
+        let dyn_live = heap.dynamic(1).expect("live dynamic slot");
+        heap.keep(dyn_live, Some(tex_taken.clone()));
+        heap.note_slot_used(dyn_live, 0);
+
+        heap.keep(1, Some(tex_frame_zero.clone()));
+        heap.note_slot_used(1, 0);
+
+        let dyn_newer = heap.dynamic(1).expect("newer dynamic slot");
+        heap.keep(dyn_newer, Some(tex_dyn_cold_second.clone()));
+        heap.note_slot_used(dyn_newer, 15);
+        let dyn_older = heap.dynamic(1).expect("older dynamic slot");
+        assert!(dyn_older > dyn_newer);
+        heap.keep(dyn_older, Some(tex_dyn_cold_first.clone()));
+        heap.note_slot_used(dyn_older, 5);
+        heap.release(dyn_newer, 1);
+        heap.release(dyn_older, 1);
+
+        let mut early = std::collections::HashMap::new();
+        heap.collect_resource_recency(50, 120, &mut early);
+        let r0_early = early.get(&(tex_frame_zero.as_raw() as usize)).expect("frame-0 entry");
+        assert!(r0_early.protected, "frame-0 slot must stay protected before frame 120");
+        assert_eq!(r0_early.kept_refs, 1);
+        let rt_early = early.get(&(tex_taken.as_raw() as usize)).expect("taken entry");
+        assert!(rt_early.protected);
+        assert_eq!(rt_early.kept_refs, 2);
+
+        let mut late = std::collections::HashMap::new();
+        heap.collect_resource_recency(200, 120, &mut late);
+        let rt_late = late.get(&(tex_taken.as_raw() as usize)).expect("taken entry at 200");
+        assert!(rt_late.protected, "taken dynamic slot stays protected regardless of frame age");
+        assert_eq!(rt_late.kept_refs, 2);
+        let r0_late = late.get(&(tex_frame_zero.as_raw() as usize)).expect("frame-0 entry at 200");
+        assert!(!r0_late.protected, "frame-0 slot becomes eligible once 200 >= 120");
+        assert_eq!(r0_late.kept_refs, 1);
+
+        let victims: std::collections::HashSet<usize> = [
+            tex_frame_zero.as_raw() as usize,
+            tex_dyn_cold_first.as_raw() as usize,
+            tex_dyn_cold_second.as_raw() as usize,
+        ]
+        .into_iter()
+        .collect();
+        let mut removed = Vec::new();
+        let mut shader_slots = Vec::new();
+        assert_eq!(heap.evict_kept_with(&victims, 50, 30, 120, &mut removed, &mut shader_slots), 0);
+        assert!(heap.made(1), "frame-0 slot must NOT bypass min_idle_frames=120 at frame 50");
+        assert_eq!(heap.evict_kept_with(&victims, 200, 30, 120, &mut removed, &mut shader_slots), 3);
+        let pos_first = removed
+            .iter()
+            .position(|r| r.as_raw() == tex_dyn_cold_first.as_raw())
+            .expect("older untaken dynamic evicted");
+        let pos_second = removed
+            .iter()
+            .position(|r| r.as_raw() == tex_dyn_cold_second.as_raw())
+            .expect("newer untaken dynamic evicted");
+        assert!(pos_first < pos_second, "older untaken dynamic slot must evict first");
+        assert!(!heap.made(1), "frame-0 slot becomes evictable once frame >= 120");
+        assert!(heap.made(0), "title slot sharing tex_taken stays protected");
+        drop(removed);
+        assert_eq!(crate::host::references(&tex_taken), 3);
     }
 }
