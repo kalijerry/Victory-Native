@@ -172,6 +172,7 @@ pub fn use_host_dir(dir: Option<&Path>) {
         Ok((host, versions)) => {
             tracing::info!(folder = %dir.display(), versions, "FidelityFX: the host's upscaler serves the title's");
             let _ = HOST.set(host);
+            victory_gpu::external::enable_host_fidelityfx();
             #[cfg(feature = "diagnostics")]
             if let Ok(mode) = std::env::var("VICTORY_FIDELITYFX_FRAMEGEN")
                 && matches!(mode.as_str(), "1" | "4")
@@ -190,7 +191,7 @@ pub fn use_host_dir(dir: Option<&Path>) {
 }
 
 /// Whether the host's FidelityFX serves the title's.
-pub(crate) fn serving() -> bool {
+pub fn serving() -> bool {
     HOST.get().is_some()
 }
 

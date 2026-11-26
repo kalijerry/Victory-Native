@@ -268,6 +268,10 @@ extern "system" fn check_feature_support(
     data: *mut c_void,
     size: u32,
 ) -> HRESULT {
+    feature_support(feature, data, size, crate::external::host_fidelityfx_enabled())
+}
+
+fn feature_support(feature: u32, data: *mut c_void, size: u32, host_fidelityfx: bool) -> HRESULT {
     const OPTIONS_QUERY: u32 = 0;
     const ARCHITECTURE: u32 = 1;
     const FEATURE_LEVELS: u32 = 2;
@@ -282,9 +286,9 @@ extern "system" fn check_feature_support(
         FEATURE_LEVELS => size_of::<FeatureLevels>(),
         FORMAT_SUPPORT => 12,
         MULTISAMPLE => 16,
-        SHADER_MODEL => 4,
-        OPTIONS1 => 24,
-        OPTIONS4 => 12,
+        SHADER_MODEL if host_fidelityfx => 4,
+        OPTIONS1 if host_fidelityfx => 24,
+        OPTIONS4 if host_fidelityfx => 12,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
             return E_NOTIMPL;
@@ -629,24 +633,28 @@ mod tests {
     /// The queries the AMD upscaler's capability check makes.
     #[test]
     fn shader_model_and_wave_options_are_the_consoles() {
-        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
-        let device = device();
-        let check = slot::<Check>(device, 0x68);
+        let check = |feature, data, size| feature_support(feature, data, size, true);
         let mut model = 0x67u32;
-        assert_eq!(check(device, 7, (&raw mut model).cast(), 4), S_OK);
+        assert_eq!(check(7, (&raw mut model).cast(), 4), S_OK);
         assert_eq!(model, 0x66);
         model = 0x62;
-        assert_eq!(check(device, 7, (&raw mut model).cast(), 4), S_OK);
+        assert_eq!(check(7, (&raw mut model).cast(), 4), S_OK);
         assert_eq!(model, 0x62);
         let mut waves = [0u32; 6];
-        assert_eq!(check(device, 8, waves.as_mut_ptr().cast(), 24), S_OK);
+        assert_eq!(check(8, waves.as_mut_ptr().cast(), 24), S_OK);
         assert_eq!(waves[..3], [1, 32, 64]);
         let mut options4 = [0u32; 3];
-        assert_eq!(check(device, 23, options4.as_mut_ptr().cast(), 12), S_OK);
+        assert_eq!(check(23, options4.as_mut_ptr().cast(), 12), S_OK);
         assert_eq!(options4[2], 1, "native 16-bit operations");
-        assert_eq!(
-            check(device, 8, waves.as_mut_ptr().cast(), 16),
-            E_INVALIDARG
-        );
+        assert_eq!(check(8, waves.as_mut_ptr().cast(), 16), E_INVALIDARG);
+    }
+
+    #[test]
+    fn fidelityfx_feature_queries_are_off_by_default() {
+        let mut data = [0u32; 6];
+        for (feature, size) in [(7, 4), (8, 24), (23, 12)] {
+            assert_eq!(feature_support(feature, data.as_mut_ptr().cast(), size, false), E_NOTIMPL);
+        }
+        assert_eq!(data, [0; 6]);
     }
 }

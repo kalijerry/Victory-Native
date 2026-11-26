@@ -251,7 +251,9 @@ pub fn run(
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) -> Result<()> {
     // First, before any thread started below can read or write the image.
-    crate::title_patch::apply(image)?;
+    if victory_hle::modules::fidelityfx::serving() {
+        crate::title_patch::apply(image)?;
+    }
     victory_loader::dump_stacks_on_schedule();
     victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();

@@ -3,11 +3,24 @@
 //! device, a title texture's host copy in the state the library is told,
 //! and the host list itself.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12Device, ID3D12GraphicsCommandList, ID3D12Resource,
 };
 
 use crate::object::Object;
+
+static HOST_FIDELITYFX: AtomicBool = AtomicBool::new(false);
+
+/// Enables compatibility behavior for a successfully loaded host upscaler.
+pub fn enable_host_fidelityfx() {
+    HOST_FIDELITYFX.store(true, Ordering::Release);
+}
+
+pub(crate) fn host_fidelityfx_enabled() -> bool {
+    HOST_FIDELITYFX.load(Ordering::Acquire)
+}
 
 /// The host D3D12 device, created on first use; `None` without a host GPU.
 pub fn host_device() -> Option<ID3D12Device> {

@@ -597,13 +597,14 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    if crashed(name) {
+    let guard_compiler = crate::external::host_fidelityfx_enabled();
+    if guard_compiler && crashed(name) {
         // E_FAIL: left out, as a pipeline the driver refused.
         return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
     }
     let create = || {
         let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
-        let _making = Making::new(name);
+        let _making = guard_compiler.then(|| Making::new(name));
         create()
     };
     let wide = HSTRING::from(name);
