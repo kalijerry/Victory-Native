@@ -158,7 +158,9 @@ impl HwStage {
     /// shaders, which run as one) have 8 system SGPRs first.
     pub fn user_sgpr(self, index: u8) -> u8 {
         match self {
-            HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Ms => index + 8,
+            // Saturating: a corrupt index (248 and up) names no SGPR rather
+            // than wrapping onto a system one.
+            HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Ms => index.saturating_add(8),
             HwStage::Vs | HwStage::Ps | HwStage::Cs => index,
         }
     }
@@ -568,10 +570,21 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         used,
         io: StageIo::Cs(ComputeIo {
             rsrc2: u32_at(packet, PACKET_RSRC2)?,
-            threads: [threads(0)?, threads(1)?, threads(2)?],
+            threads: group([threads(0)?, threads(1)?, threads(2)?])?,
         }),
         code: code.to_vec(),
     })
+}
+
+/// A compute program's thread group, within the hardware's 1024 threads
+/// (each side and in all): the translator multiplies its sides in 32 bits,
+/// which a corrupt group overflowed. Zeros are left to the later stages.
+fn group(threads: [u32; 3]) -> Result<[u32; 3], ShaderError> {
+    let total: u64 = threads.iter().map(|&t| u64::from(t)).product();
+    if threads.iter().any(|&t| t > 1024) || total > 1024 {
+        return Err(Malformed("implausible thread group"));
+    }
+    Ok(threads)
 }
 
 fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -728,11 +741,11 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             HwStage::Vs => vs_io(stage_data)?,
             HwStage::Cs => StageIo::Cs(ComputeIo {
                 rsrc2: u32_at(stage_data, CS_RSRC2)?,
-                threads: [
+                threads: group([
                     u32_at(stage_data, CS_THREADS)?,
                     u32_at(stage_data, CS_THREADS + 4)?,
                     u32_at(stage_data, CS_THREADS + 8)?,
-                ],
+                ])?,
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
             _ => StageIo::None,
@@ -1105,6 +1118,29 @@ mod tests {
 
         blob[patch..][..4].copy_from_slice(&3u32.to_le_bytes());
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());
+    }
+
+    /// A thread group beyond the hardware's 1024 threads is refused when the
+    /// program is read: the translator's products of its sides overflowed.
+    #[test]
+    fn refuses_implausible_thread_groups() {
+        let groups = [
+            ([16, 16, 1], true),
+            ([0, 0, 0], true),
+            ([1024, 1, 1], true),
+            ([1025, 1, 1], false),
+            ([64, 64, 1], false),
+            ([0x1_0000, 0x1_0000, 1], false),
+        ];
+        for (threads, plausible) in groups {
+            let mut blob = fssm(&[(HwStage::Cs, &VS_CODE)]);
+            let e = stage_data_at(&blob, HwStage::Cs);
+            for (i, t) in threads.iter().enumerate() {
+                blob[e + CS_THREADS + 4 * i..][..4].copy_from_slice(&u32::to_le_bytes(*t));
+            }
+            let found = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]));
+            assert_eq!(found.is_ok(), plausible, "{threads:?}");
+        }
     }
 
     #[test]
