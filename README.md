@@ -126,6 +126,9 @@ cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
+On an RTX 5080, Ryzen 9 9950X3D and 32 GB PC: `scripts\play-rtx5080.ps1`, and read
+[docs/pc-rtx5080-9950x3d.md](docs/pc-rtx5080-9950x3d.md) first.
+
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
 
