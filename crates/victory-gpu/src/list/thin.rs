@@ -478,7 +478,7 @@ pub(super) fn upscale(this: This, up: &super::Upscale) -> bool {
     if front.closed || front.recording.is_none() {
         return false;
     }
-    front.put(UPSCALE, &up.to_words());
+    front.put(UPSCALE, &(*up).to_words());
     true
 }
 

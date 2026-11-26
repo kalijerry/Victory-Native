@@ -836,7 +836,7 @@ pub struct Upscale {
 impl Upscale {
     pub(crate) const WORDS: usize = 11;
 
-    pub(crate) fn to_words(&self) -> [u64; Self::WORDS] {
+    pub(crate) fn to_words(self) -> [u64; Self::WORDS] {
         let pair = |a: f32, b: f32| u64::from(a.to_bits()) | u64::from(b.to_bits()) << 32;
         [
             self.colour,

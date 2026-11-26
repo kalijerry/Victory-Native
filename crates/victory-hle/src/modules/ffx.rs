@@ -113,7 +113,7 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                 static N: AtomicU32 = AtomicU32::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
                 // the first 12 upscales, then one in 300
-                if n < 12 || n % 300 == 0 {
+                if n < 12 || n.is_multiple_of(300) {
                     let inputs = victory_gpu::list::upscale_inputs(&[
                         d.colour.resource,
                         d.depth.resource,
