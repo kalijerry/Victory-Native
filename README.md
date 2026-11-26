@@ -152,6 +152,10 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   `VICTORY_FFX_SCALE=<scale>` sets the render scale (`0.5` renders 1080p for a
   4K output). Run with `--console series-x` and point `VICTORY_FIDELITYFX_DIR`
   at the FidelityFX SDK's `Kits/FidelityFX/signedbin` folder.
+  Use `scripts/play.ps1 -Safe` and pass the FidelityFX switches with `-More`.
+  The default thin recording path can produce a black screen with host FSR.
+  At 4K output, set `VICTORY_FFX_SCALE` below `1.0` to avoid the title's
+  native-4K renderer startup failure.
   The Series X patches, extra device feature answers and compiler-crash
   guard take effect only after a host upscaler loads from that folder.
   `VICTORY_FIDELITYFX_FRAMEGEN=1` adds AMD frame generation with the built-in

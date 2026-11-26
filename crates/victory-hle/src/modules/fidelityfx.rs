@@ -12,7 +12,8 @@
 //! title's command list and resources (their host list and host copies, in
 //! the states the title gives, see `victory_gpu::external`). The rest passes
 //! through unchanged: sizes, flags, jitter, motion-vector scale, camera
-//! values, the resource descriptions, the context. Only the upscaler: other
+//! values and the context. Resource formats follow the host allocations.
+//! Only the upscaler: other
 //! effects the title asks for (frame generation) are refused. A diagnostics
 //! build generates frames itself from the upscale's depth and motion
 //! vectors with `VICTORY_FIDELITYFX_FRAMEGEN=1` (`victory_gpu::external::
@@ -28,6 +29,7 @@ use std::sync::OnceLock;
 
 use victory_gpu::object::Object;
 use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 use windows::core::Interface;
 
 use crate::{HleModule, hle_export};
@@ -40,6 +42,7 @@ const OK: u32 = 0;
 const UNKNOWN_TYPE: u32 = 2;
 const NO_PROVIDER: u32 = 4;
 const PARAMETER: u32 = 6;
+const FFX_RGBA16_FLOAT: u32 = 4;
 
 // Description types.
 const CREATE_UPSCALE: u64 = 0x1_0000;
@@ -444,10 +447,11 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     let title = dispatch;
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
-    for r in dispatch
+    for (slot, r) in dispatch
         .resources
         .iter_mut()
-        .filter(|r| !r.resource.is_null())
+        .enumerate()
+        .filter(|(_, r)| !r.resource.is_null())
     {
         let wanted = host_state(r.state);
         let texture = wanted.and_then(|w| {
@@ -457,24 +461,50 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         let Some((texture, _)) = texture else {
             once!(
                 warn,
+                slot,
                 state = r.state,
                 "FidelityFX: a resource has no host texture in its state; the upscaling did not run"
             );
             return PARAMETER;
         };
         r.resource = texture.as_raw();
+        // SAFETY: this is the live host texture passed to the SDK below.
+        if unsafe { texture.GetDesc() }.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+            // The host may store the title's packed color target in FP16.
+            r.description[1] = FFX_RGBA16_FLOAT;
+        }
         textures.push(texture);
     }
-    once!(info, formats = ?textures.iter().map(|t| {
-        // SAFETY: a live texture.
-        unsafe { t.GetDesc() }.Format.0
-    }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
-    let code = victory_gpu::external::record(list, |host_list| {
+    once!(
+        info,
+        resources = ?dispatch.resources.iter().enumerate()
+            .filter(|(_, r)| !r.resource.is_null()).zip(&textures)
+            .map(|((slot, r), texture)| {
+                // SAFETY: a live host texture.
+                let desc = unsafe { texture.GetDesc() };
+                (slot, [r.description[2], r.description[3]],
+                    [desc.Width, u64::from(desc.Height)], r.description[1], desc.Format.0)
+            }).collect::<Vec<_>>(),
+        "FidelityFX: first upscale resources (slot, SDK size, host size, SDK format, DXGI format)"
+    );
+    let result = victory_gpu::external::record(list, |host_list| {
         dispatch.list = host_list.as_raw();
         // SAFETY: the PC dispatch on host objects; the context is the host's.
         unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
-    })
-    .unwrap_or(PARAMETER);
+    });
+    let Some(code) = result else {
+        once!(warn, "FidelityFX: no host command list for the upscale dispatch");
+        return PARAMETER;
+    };
+    if code != OK {
+        once!(
+            warn,
+            result = code,
+            render = ?&dispatch.rest[4..6],
+            output = ?&dispatch.rest[6..8],
+            "FidelityFX: the host SDK rejected the upscale dispatch"
+        );
+    }
     #[cfg(feature = "diagnostics")]
     if code == OK && !context.is_null() {
         // SAFETY: the title passes its context slot.
@@ -482,7 +512,15 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         let (depth, motion) = (title.resources[1], title.resources[2]);
         if !depth.resource.is_null() && !motion.resource.is_null() {
             let frame = frame_inputs(&title, flags);
-            once!(info, result = code, render = ?frame.render, "FidelityFX: first successful host upscale");
+            once!(
+                info,
+                result = code,
+                render = ?frame.render,
+                output = ?&dispatch.rest[6..8],
+                jitter = ?frame.jitter,
+                motion_scale = ?frame.motion_scale,
+                "FidelityFX: first successful host upscale"
+            );
             victory_gpu::external::frame_generation_inputs(
                 list,
                 depth.resource.cast::<Object>().cast_const(),

@@ -51,6 +51,17 @@ pub(crate) fn apply(image: &LoadedImage) -> Result<()> {
     let scale = requested("VICTORY_FFX_SCALE", "<scale in (0, 1]>", |s| {
         s.parse::<f32>().ok().filter(|s| *s > 0.0 && *s <= 1.0)
     });
+    if matches!(
+        victory_hle::console::current(),
+        victory_hle::console::Console::SeriesX
+    ) && victory_loader::resolution::asked_output().unwrap_or((3840, 2160)) == (3840, 2160)
+        && kind == Some(Some(7))
+        && (scale.is_none() || scale == Some(Some(1.0)))
+    {
+        bail!(
+            "Series X host FSR at native 4K can stop the title during renderer initialization. Set VICTORY_FFX_SCALE below 1.0 or use the title's upscaler for native rendering"
+        );
+    }
     // Everything asked for is found before anything is written.
     let picker = kind.map(|kind| kind.and_then(|kind| picker_patch(image, kind)));
     let scale = scale.map(|scale| scale.and_then(|scale| scale_patch(image, scale)));
