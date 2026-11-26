@@ -1410,23 +1410,33 @@ fn for_pieces_of(from: usize, to: usize, mut f: impl FnMut(usize, usize)) {
 
 /// Copies `len` bytes whose destination the CPU does not read again soon (a
 /// snapshot, compared only after the card ran), with streaming stores if
-/// they are many (`VICTORY_STREAM_COPY=0`: a plain copy).
+/// they are many (`VICTORY_STREAM_COPY=1`; off unless given, a plain copy).
 ///
 /// An ordinary copy reads each line of the destination before it writes
 /// it. On an i9-12900K with two DDR5-5200 modules writes are what is
 /// scarce: 512 MB copied 14.5 GB/s on one thread and no more on sixteen,
 /// written alone 23 GB/s, copied with streaming stores 24 GB/s (reads 37
-/// GB/s on one thread, 55 on several).
+/// GB/s on one thread, 55 on several). Off by default until it is measured
+/// on more machines than that one.
 ///
 /// # Safety
 /// Both ranges are valid for `len` bytes and do not overlap.
 pub(crate) unsafe fn copy_streaming(src: *const u8, dst: *mut u8, len: usize) {
+    // SAFETY: the caller's.
+    unsafe { copy_streaming_if(src, dst, len, streaming()) }
+}
+
+/// [`copy_streaming`], streaming if `stream` says so (and AVX2 is there).
+///
+/// # Safety
+/// As [`copy_streaming`].
+unsafe fn copy_streaming_if(src: *const u8, dst: *mut u8, len: usize, stream: bool) {
     // Below this a plain copy: the head and tail cost as much, and small
     // destinations may well be in the cache already.
     const FEW: usize = 4096;
     #[cfg(target_arch = "x86_64")]
-    if len >= FEW && streaming() {
-        // SAFETY: the caller's; AVX2 is there (`streaming`).
+    if len >= FEW && stream && avx2() {
+        // SAFETY: the caller's; AVX2 is there (asked just above).
         unsafe { stream_avx2(src, dst, len) };
         return;
     }
@@ -1441,7 +1451,7 @@ fn streaming() -> bool {
         return on && avx2();
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| avx2() && std::env::var_os("VICTORY_STREAM_COPY").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| avx2() && std::env::var_os("VICTORY_STREAM_COPY").is_some_and(|v| v == "1"))
 }
 
 fn avx2() -> bool {
@@ -1926,13 +1936,16 @@ mod wide_tests {
     /// plain copy's threshold, at it, a few blocks more, an odd tail).
     #[test]
     fn a_streaming_copy_copies_the_range_and_nothing_beside() {
+        // (Streamed whatever `VICTORY_STREAM_COPY` says; without AVX2 it would
+        // test the plain copy only.)
+        assert!(super::avx2());
         let src: Vec<u8> = (0..300_000usize).map(|i| (i * 131 + i / 251) as u8).collect();
         for len in [0usize, 1, 31, 4095, 4096, 4097, 4096 + 127, 70_001, 200_000] {
             for src_at in [0usize, 1, 7, 32, 45] {
                 for dst_at in [0usize, 1, 13, 31, 32, 64 + 5] {
                     let mut dst = vec![0xA5u8; len + dst_at + 100];
                     // SAFETY: both inside their vectors, apart.
-                    unsafe { super::copy_streaming(src.as_ptr().add(src_at), dst.as_mut_ptr().add(dst_at), len) };
+                    unsafe { super::copy_streaming_if(src.as_ptr().add(src_at), dst.as_mut_ptr().add(dst_at), len, true) };
                     let at = (len, src_at, dst_at);
                     assert!(dst[..dst_at].iter().all(|&b| b == 0xA5), "before {at:?}");
                     assert!(dst[dst_at..dst_at + len] == src[src_at..src_at + len], "inside {at:?}");

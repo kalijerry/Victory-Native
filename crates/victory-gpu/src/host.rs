@@ -8678,7 +8678,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 
 /// [`copy_mapped`] of title memory into a host copy's CPU side, which the CPU
 /// does not read again soon: many bytes go with streaming stores
-/// ([`crate::safecopy::copy_streaming`]; `VICTORY_STREAM_REFRESH=0`: as
+/// ([`crate::safecopy::copy_streaming`]; `VICTORY_STREAM_REFRESH=1`; off unless given: as
 /// [`copy_mapped`]). What fails is copied again as [`copy_mapped`] does.
 pub(crate) fn copy_streamed(dst: *mut u8, src: *const u8, len: usize) {
     // Below a page the head and tail are most of it, and a plain copy may
@@ -8697,7 +8697,7 @@ fn stream_refresh() -> bool {
     *ON.get_or_init(|| {
         crate::safecopy::on()
             && std::is_x86_feature_detected!("avx2")
-            && std::env::var_os("VICTORY_STREAM_REFRESH").is_none_or(|v| v != "0")
+            && std::env::var_os("VICTORY_STREAM_REFRESH").is_some_and(|v| v == "1")
     })
 }
 
