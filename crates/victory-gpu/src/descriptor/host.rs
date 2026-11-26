@@ -210,9 +210,34 @@ impl Pool {
     /// Gives back `n` slots from `start`, joining the free runs before and
     /// after so that a run cut into pieces is whole again. How many of them
     /// were taken.
+    ///
+    /// A slot given back that is free already (a run given back twice, or two
+    /// giving back runs that meet) must not leave two runs over it, so the
+    /// free runs reaching into the range are cut back to it first.
     fn give(&mut self, start: usize, n: usize) -> u32 {
         let end = (start + n).min(self.end);
-        let (mut lo, mut hi) = (start, end.max(start));
+        if start >= end {
+            return 0;
+        }
+        let given = self.taken[start..end].iter().filter(|taken| **taken).count() as u32;
+        let reaching: Vec<(usize, usize)> = self
+            .at
+            .range(..end)
+            .rev()
+            .take_while(|(at, len)| **at + **len > start)
+            .map(|(&at, &len)| (at, len))
+            .collect();
+        for (at, len) in reaching {
+            self.remove(at, len);
+            if at < start {
+                self.add(at, start - at);
+            }
+            if at + len > end {
+                self.add(end, at + len - end);
+            }
+        }
+        self.taken[start..end].fill(false);
+        let (mut lo, mut hi) = (start, end);
         while lo > 0 && !self.taken[lo - 1] {
             let Some((&at, &len)) = self.at.range(..lo).next_back() else { break };
             if at + len != lo {
@@ -229,8 +254,6 @@ impl Pool {
             self.remove(at, len);
             hi += len;
         }
-        let given = self.taken[start..end].iter().filter(|taken| **taken).count() as u32;
-        self.taken[start..end].fill(false);
         if hi > lo {
             self.add(lo, hi - lo);
         }
@@ -300,35 +323,37 @@ impl Pools {
     }
 
     /// A table bigger than a shard: whole runs off the end of one shard and
-    /// the starts of the ones after it.
+    /// the starts of the ones after it. A taken slot between the shards
+    /// would break the table, so every run has to reach on into the next
+    /// shard without one: from the shard the table starts in it has to
+    /// reach that shard's end, and in the shards after it it has to start
+    /// at the shard's own start.
     fn take_wide(&self, n: usize) -> Option<usize> {
         let _wide = self.wide.lock().unwrap_or_else(|e| e.into_inner());
-        let mut got: Vec<(usize, usize)> = Vec::new();
         for shard in 0..self.shards.len() {
             let mut need = n;
-            let mut at = shard;
-            let mut start = 0;
-            let mut spans = Vec::new();
-            while need > 0 && at < self.shards.len() {
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for at in shard..self.shards.len() {
                 let mut pool = self.shards[at].lock().unwrap_or_else(|e| e.into_inner());
-                let Some((local, have)) = (if at == shard { pool.last_run() } else { pool.first_run() }) else { break };
+                let end = pool.end;
+                let run = if at == shard { pool.last_run() } else { pool.first_run() };
+                let Some((local, have)) = run else { break };
+                if (at == shard && local + have != end) || (at != shard && local != 0) {
+                    break;
+                }
                 let take = have.min(need);
                 pool.take_at(local, take);
-                if at == shard {
-                    start = local;
-                }
-                spans.push((at * self.size + local, take));
                 need -= take;
-                at += 1;
+                spans.push((at * self.size + local, take));
+                if need == 0 || local + have != end {
+                    break;
+                }
             }
             if need == 0 {
-                return Some(shard * self.size + start);
+                return Some(spans[0].0);
             }
             // (Not this one: what it took goes back.)
             for (at, len) in spans {
-                got.push((at, len));
-            }
-            for (at, len) in got.drain(..) {
                 self.give(at, len);
             }
         }
@@ -5330,6 +5355,42 @@ mod tests {
         assert_eq!(pool.free(), 0);
     }
 
+    /// Giving back a slot that is free already leaves one run over it, not
+    /// two that take may hand out twice.
+    #[test]
+    fn a_slot_given_back_twice_stays_one_run() {
+        let mut pool = Pool::new(8);
+        assert_eq!(pool.take(8), Some(0));
+        pool.give(2, 2);
+        assert_eq!(pool.free(), 2);
+        // (3 was free in the range before; 4 is free in this one too.)
+        pool.give(3, 2);
+        assert_eq!(pool.free(), 3);
+        assert_eq!(pool.at.iter().map(|(&at, &len)| (at, len)).collect::<Vec<_>>(), [(2, 3)]);
+        assert_eq!(pool.take(3), Some(2));
+        assert_eq!(pool.free(), 0);
+    }
+
+    /// A table wider than a shard steps over no taken slot: it starts in a
+    /// shard whose free run reaches that shard's end and goes on through
+    /// the shards after it from their starts.
+    #[test]
+    fn a_wide_table_steps_over_no_taken_slot() {
+        let pools = Pools::new(64);
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            held.push(pools.take(8).unwrap());
+        }
+        // (The first three shards free again, but the first shard's last
+        // slot stays taken: its run no longer reaches the shard's end.)
+        assert_eq!(held[0], 0);
+        assert_eq!(pools.give(0, 7), 7);
+        assert_eq!(pools.give(held[1], 8), 8);
+        assert_eq!(pools.give(held[2], 8), 8);
+        // (8..17, not 0..9 across the taken slot 7.)
+        assert_eq!(pools.take(9), Some(8));
+    }
+
     /// The shards hand out runs that stay inside one shard, and a run given
     /// back joins its neighbours there.
     #[test]
@@ -5834,8 +5895,8 @@ mod tests {
         assert_eq!((address, bytes), (start + 456, 3 * 456));
         assert_eq!(made, copy.buffer, "the descriptor and refresh share a copy");
         if victory_shader::emit::raw_views() == 0 {
+            // (Without a raw twin the descriptor reads a copy of its own.)
             assert_eq!(copy.span(), (address, bytes));
-            eprintln!("the structured slot without a raw twin uses a view-relative copy");
         } else {
             assert_eq!(copy.span(), (start, 4 * 456));
         }
@@ -6277,11 +6338,7 @@ mod tests {
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
-        eprintln!("free after release {}", heap.free.load(std::sync::atomic::Ordering::Relaxed));
-        for (i, sh) in heap.pool.shards.iter().enumerate() { let pl = sh.lock().unwrap_or_else(|e| e.into_inner()); eprintln!("shard {i} free {} runs {:?}", pl.free(), pl.at); }
         assert_eq!(heap.dynamic(50), Some(4));
-        eprintln!("free after 50 {}", heap.free.load(std::sync::atomic::Ordering::Relaxed));
-        for (i, sh) in heap.pool.shards.iter().enumerate() { let pl = sh.lock().unwrap_or_else(|e| e.into_inner()); eprintln!("shard {i} free {} runs {:?}", pl.free(), pl.at); }
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
 
