@@ -3094,8 +3094,8 @@ impl HostHeap {
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
     /// one) show the constant buffer of `size` bytes at `gpu` of `buffer`
-    /// (title memory in place) with nothing copied: its raw twin a raw view
-    /// of those bytes, which translated shaders read; the slot itself a
+    /// (title memory in place or a host copy) with nothing copied: its raw twin
+    /// a raw view of those bytes, which translated shaders read; the slot itself a
     /// constant buffer view of them where that can be (on 256 bytes), else a
     /// null one. Whether the twin was made (`false`: the caller copies the
     /// bytes as before).
