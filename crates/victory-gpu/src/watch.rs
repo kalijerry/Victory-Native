@@ -2072,7 +2072,39 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    if status >= 0 {
+        return region.region_type & PLACEHOLDER_RESERVATION != 0;
+    }
+    const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003_u32 as i32;
+    status == STATUS_INVALID_INFO_CLASS && reserved_like_a_placeholder(block)
+}
+
+/// Where class 7 is not answered (Wine: `STATUS_INVALID_INFO_CLASS`, and its
+/// class 3 leaves the type word 0), [`placeholder`] was false for every
+/// block, so no hole was ever known: each was asked about at every asking,
+/// 13,000-23,000 `VirtualQuery` calls a frame behind Wine's one lock for
+/// virtual memory (#59: "waiting for the guards" 15-21 ms a frame, 0.5-6 ms
+/// with this). A reservation made as a placeholder is private, reserved and
+/// `PAGE_NOACCESS` (the only protection `MEM_RESERVE_PLACEHOLDER` takes; the
+/// runtime's are made so) over the whole block. A plain reservation of that
+/// kind passes too, and is still found when the runtime commits it
+/// (`title_memory_allocated`) and by `look_at_holes`; plain read-write or
+/// section reservations do not pass, so what an ordinary `VirtualAlloc`
+/// commits there is still seen. After Kayotic1337 and zocram4cc (#59).
+fn reserved_like_a_placeholder(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    let at = block * BLOCK;
+    // SAFETY: plain data, filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: an out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_RESERVE
+        && info.Type == MEM_PRIVATE
+        && info.AllocationProtect == PAGE_NOACCESS
+        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(BLOCK)
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
