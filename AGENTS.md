@@ -46,8 +46,9 @@ and plan the real implementation.
 - Each person or agent works in a git worktree and on a branch of its own.
 - Shared notes: `reports/` in the coordination folder (run requests, review campaign
   `PR_REVIEW.md`, plans). Edit only your own rows or sections.
-- Branches: `integration` collects reviewed pull requests and is measured as a whole; `main`
-  moves when `integration` shows no unjustified regression.
+- Branches start from `main` and come back to it once their tests pass and a run shows no
+  unjustified regression. Work is done here, not upstream; upstream commits and pull requests
+  are read and taken only where they fit the rule above.
 - Upstream code is taken with `git cherry-pick -x` of the commits that belong to the change,
   never by merging a branch that carries unrelated upstream commits.
 

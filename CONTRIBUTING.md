@@ -47,14 +47,14 @@ request gets a review and a decision, with the reason.
 | REJECTED | incorrect, not needed, or against the rule above. The reason is always given. |
 
 Decisions rest on the code, the tests and runs, not on the description alone. Pull requests
-go to `integration` first, where they are measured together. `integration` moves to `main`
-only when nothing regresses in picture, stability or frame time, or when a regression is
-justified and stated.
+go to `main`. One is merged when its tests pass and a run shows nothing regressing in picture,
+stability or frame time, or when a regression is justified and stated.
 
-## Pull requests from upstream
+## Upstream
 
-The open pull requests of [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
-are reviewed here; the tracking file is `reports/PR_REVIEW.md` in the coordination notes.
+Victory Native goes its own way and is developed here, not upstream. The commits and pull
+requests of [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) are still read,
+and taken when they fit the rule above. Its open pull requests are reviewed here; the tracking file is `reports/PR_REVIEW.md` in the coordination notes.
 The ones we take are opened again here, with their title, description and commit authors
 kept and a link to the original. Their authors are welcome to carry them on here. The upstream
 pull requests themselves are never modified or closed by us.
