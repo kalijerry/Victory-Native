@@ -83,7 +83,7 @@ pub(crate) struct HeapDesc {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResourceDesc {
     dimension: u32,
     alignment: u64,
@@ -1429,7 +1429,7 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 /// title places in that memory in another format shows ([`alias_of`]). A
 /// texture leaves the table before it is freed.
 #[cfg(windows)]
-static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
+static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// For `this`, a texture made for a view the title placed in memory
@@ -1478,7 +1478,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     }
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
+    let other = *targets.get(&(r.data() as u64))?.last()? as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
@@ -2754,10 +2754,15 @@ fn hand_out_resource(
         textures().insert(at);
         crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
-            TARGETS_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(resource.data() as u64, at);
+            let address = resource.data() as u64;
+            let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+            // Title allocations stay last (preferred over synthetic ones).
+            let owners = targets.entry(address).or_default();
+            if matches!(resource.backing, Backing::Address(_)) {
+                owners.insert(0, at);
+            } else {
+                owners.push(at);
+            }
         }
         if !lazy() {
             let _ = hosted(at as This, true);
@@ -2784,8 +2789,12 @@ impl Drop for Resource {
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
-                if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
-                    targets.remove(&at);
+                let me = std::ptr::from_ref::<Resource>(self) as usize;
+                if let Some(owners) = targets.get_mut(&at) {
+                    owners.retain(|&owner| owner != me);
+                    if owners.is_empty() {
+                        targets.remove(&at);
+                    }
                 }
             }
         }
@@ -3071,6 +3080,32 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(*found as This)
 }
 
+/// Addresses in [`PLACED_TEXTURES`] whose resource description matches
+/// `desc` with the filler words (1 and 13) ignored, and how many keys
+/// matched: whether a view with no address of its own can be tied to one
+/// texture, and how tightly (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_textures_like(desc: &[u32; 14]) -> (usize, Vec<u64>) {
+    let mut key = *desc;
+    key[1] = 0;
+    key[13] = 0;
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut keys = 0;
+    let mut addresses: Vec<u64> = Vec::new();
+    for ((address, other), _) in map.iter() {
+        let mut blank = *other;
+        blank[1] = 0;
+        blank[13] = 0;
+        if blank == key {
+            keys += 1;
+            if !addresses.contains(address) && addresses.len() < 8 {
+                addresses.push(*address);
+            }
+        }
+    }
+    (keys, addresses)
+}
+
 /// From which level on the title texture's host copy was filled, and from
 /// which bytes (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -3143,6 +3178,41 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(out)
 }
 
+/// The title resource the GPU writes at `address`, held while a descriptor
+/// made from it lives. A synthetic stand-in is made only when the title has
+/// created none: one must never displace a title object (writes would go
+/// to a copy nothing else sees).
+#[cfg(windows)]
+pub(crate) fn writable_texture_at(address: u64, words: &[u32; 14]) -> Option<ResourceRef> {
+    // SAFETY: 56 bytes in the title resource description's layout.
+    let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if address == 0 || !(2..=4).contains(&desc.dimension) || desc.flags & 4 == 0 {
+        return None;
+    }
+    let find = || {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let target = *targets.get(&address)?.last()? as This;
+        if !object::try_add_ref(target) {
+            return Some(None);
+        }
+        let owner = ResourceRef(target as usize);
+        drop(targets);
+        let existing = resource(owner.as_ptr()).desc;
+        let same_shape = ResourceDesc {
+            alignment: desc.alignment,
+            flags: desc.flags,
+            ..existing
+        } == desc;
+        Some((same_shape && existing.flags & desc.flags == desc.flags).then_some(owner))
+    };
+    if let Some(owner) = find() {
+        return owner;
+    }
+    let texture = texture_at(address, words)?;
+    // Another title object may have arrived while making the synthetic one.
+    find().unwrap_or_else(|| Some(ResourceRef::new(texture)))
+}
+
 pub(crate) extern "system" fn create_placed(
     _: This,
     heap: This,
@@ -3201,6 +3271,29 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
 }
 extern "system" fn resource_release(this: This) -> u32 {
     object::release_boxed::<Resource>(this)
+}
+
+/// Holds a title resource while a descriptor made from it lives.
+#[cfg(windows)]
+pub(crate) struct ResourceRef(usize);
+
+#[cfg(windows)]
+impl ResourceRef {
+    pub(crate) fn new(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+
+    pub(crate) fn as_ptr(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ResourceRef {
+    fn drop(&mut self) {
+        resource_release(self.as_ptr());
+    }
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
 /// `out` only asks for residency.
