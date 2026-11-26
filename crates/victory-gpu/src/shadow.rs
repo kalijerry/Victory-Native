@@ -2051,8 +2051,28 @@ const KERNEL_PAGE: usize = 4096;
 /// all sent, 28 of 72 MB over the bus in all (run submit-2). Only pages a
 /// landing was noted in are compared, 4 KiB at a time: a page that is not the
 /// same goes up whole, as before, and so does every other.
+///
+/// Off by default under Wine (`VICTORY_LAND_ECHO=1` turns it on there): on
+/// Proton two main characters of the boat cutscene had no facial skin with
+/// it, and every face was right with it alone off, at the same frame rate
+/// (#59, bisected over play.ps1's switches). `-Safe` already turned it off.
 fn land_echo() -> bool {
+    static WINE_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *WINE_OFF.get_or_init(|| std::env::var_os("VICTORY_LAND_ECHO").is_none() && on_wine()) {
+        return false;
+    }
     crate::toggled!("VICTORY_LAND_ECHO")
+}
+
+/// Whether we run under Wine: its ntdll exports `wine_get_version` (as
+/// `victory_hle::modules::xmem` tells it).
+fn on_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain lookups in ntdll, always loaded.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
 }
 
 /// Since the last frame-rate line: bytes found to be a landing's alone, and
