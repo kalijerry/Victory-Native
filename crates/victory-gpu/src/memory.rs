@@ -118,6 +118,13 @@ pub(crate) enum Use {
     Builds { back: bool },
 }
 
+/// A builder write at a root address or a copy-back at a buffer's start.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum BuilderMemoryUse {
+    Write(u64),
+    Back(u64),
+}
+
 /// A page of title memory in an arena.
 struct Held {
     /// Where in the arena's memory, and the arena's place in `copies`.
@@ -986,11 +993,14 @@ pub(crate) fn ready(
             });
             m.bring_up(list);
         }
-        if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
+        if builds
+            && written.contains(&at)
+            && list.first_builder_memory_use(BuilderMemoryUse::Write(at))
+        {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
                 && len <= BACK
                 && use_ == (Use::Builds { back: true })
-                && list.first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
+                && list.first_builder_memory_use(BuilderMemoryUse::Back(start))
             {
                 m.small(list, start, len);
             }

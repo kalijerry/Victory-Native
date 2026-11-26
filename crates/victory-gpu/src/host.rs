@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+use crate::memory::BuilderMemoryUse;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -1145,6 +1147,69 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    mod builder_memory {
+        use super::super::Deferred;
+        use crate::memory::BuilderMemoryUse::{Back, Write};
+
+        const A: u64 = 0x1_0001_0000;
+        const B: u64 = 0x3_0001_0000;
+
+        #[test]
+        fn admits_writes_eight_gib_apart() {
+            let mut recording = Deferred::default();
+            assert!(recording.first_builder_memory_use(Write(A)));
+            assert!(
+                recording.first_builder_memory_use(Write(B)),
+                "write at {B:#x} after {A:#x}"
+            );
+        }
+
+        #[test]
+        fn admits_copy_backs_eight_gib_apart() {
+            let mut recording = Deferred::default();
+            assert!(recording.first_builder_memory_use(Back(A)));
+            assert!(
+                recording.first_builder_memory_use(Back(B)),
+                "copy-back at {B:#x} after {A:#x}"
+            );
+        }
+
+        #[test]
+        fn deduplicates_exact_repeats_per_operation() {
+            let mut recording = Deferred::default();
+            assert!(recording.first_builder_memory_use(Write(A)));
+            assert!(recording.first_builder_memory_use(Back(A)));
+            assert!(!recording.first_builder_memory_use(Write(A)));
+            assert!(!recording.first_builder_memory_use(Back(A)));
+        }
+
+        #[test]
+        fn keeps_byte_offsets_within_a_dword() {
+            let mut recording = Deferred::default();
+            for at in A..A + 4 {
+                let write = recording.first_builder_memory_use(Write(at));
+                let back = recording.first_builder_memory_use(Back(at));
+                assert_eq!((write, back), (true, true), "write and copy-back at {at:#x}");
+            }
+        }
+
+        #[test]
+        fn scopes_uses_to_each_recording_and_reset() {
+            let mut first = Deferred::default();
+            let mut second = Deferred::default();
+            for key in [Write(A), Back(A)] {
+                assert!(first.first_builder_memory_use(key));
+                assert!(second.first_builder_memory_use(key));
+            }
+            // HostList::reset replaces its Deferred after the list finishes.
+            first = Deferred::default();
+            for key in [Write(A), Back(A)] {
+                assert!(first.first_builder_memory_use(key));
+                assert!(!second.first_builder_memory_use(key));
+            }
+        }
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -2393,6 +2458,8 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Builder writes and small-buffer copy-backs requested since the last reset.
+    builder_memory: std::collections::HashSet<BuilderMemoryUse>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2417,6 +2484,10 @@ struct Deferred {
 }
 
 impl Deferred {
+    fn first_builder_memory_use(&mut self, key: BuilderMemoryUse) -> bool {
+        self.builder_memory.insert(key)
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -6996,6 +7067,7 @@ impl HostList {
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
+                && deferred.builder_memory.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
                 && deferred.texture_backs.is_empty())
@@ -7457,6 +7529,11 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Whether this recording first requests this builder operation and byte address.
+    pub(crate) fn first_builder_memory_use(&self, key: BuilderMemoryUse) -> bool {
+        self.deferred().first_builder_memory_use(key)
     }
 
     /// Whether `key` was asked about ([`HostList::first_use`]) since the
