@@ -811,23 +811,99 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     0
 }
 
-/// The title's upscale (its `ffxDispatch`, Series S) as a plain stretch of
-/// the colour input over the output (`crate::stretch`), in place of the
-/// title's own FidelityFX passes; false if it could not be recorded. From
-/// CuteBooty/victory-8gb.
+/// What the title gives its upscale (`ffxDispatch`, Series S), as plain words
+/// so that a list whose calls are only written down (`VICTORY_THIN=1`) can
+/// carry it to the thread that records.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Upscale {
+    pub colour: u64,
+    pub depth: u64,
+    pub motion: u64,
+    pub exposure: u64,
+    pub output: u64,
+    pub render: [u32; 2],
+    pub jitter: [f32; 2],
+    pub motion_scale: [f32; 2],
+    pub reset: bool,
+    pub pre_exposure: f32,
+    pub near: f32,
+    pub far: f32,
+    pub frame_ms: f32,
+    /// DLSS where it can (`crate::dlss`, the `dlss` feature), else a stretch.
+    pub dlss: bool,
+}
+
+impl Upscale {
+    pub(crate) const WORDS: usize = 11;
+
+    pub(crate) fn to_words(&self) -> [u64; Self::WORDS] {
+        let pair = |a: f32, b: f32| u64::from(a.to_bits()) | u64::from(b.to_bits()) << 32;
+        [
+            self.colour,
+            self.depth,
+            self.motion,
+            self.exposure,
+            self.output,
+            u64::from(self.render[0]) | u64::from(self.render[1]) << 32,
+            pair(self.jitter[0], self.jitter[1]),
+            pair(self.motion_scale[0], self.motion_scale[1]),
+            pair(self.pre_exposure, self.frame_ms),
+            pair(self.near, self.far),
+            u64::from(self.reset) | u64::from(self.dlss) << 1,
+        ]
+    }
+
+    pub(crate) fn from_words(w: &[u64]) -> Option<Self> {
+        if w.len() < Self::WORDS {
+            return None;
+        }
+        let pair = |v: u64| [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)];
+        let [pre_exposure, frame_ms] = pair(w[8]);
+        let [near, far] = pair(w[9]);
+        Some(Self {
+            colour: w[0],
+            depth: w[1],
+            motion: w[2],
+            exposure: w[3],
+            output: w[4],
+            render: [w[5] as u32, (w[5] >> 32) as u32],
+            jitter: pair(w[6]),
+            motion_scale: pair(w[7]),
+            pre_exposure,
+            frame_ms,
+            near,
+            far,
+            reset: w[10] & 1 != 0,
+            dlss: w[10] & 2 != 0,
+        })
+    }
+}
+
+/// The title's upscale in place of its own FidelityFX passes (slow translated
+/// for 32-lane cards): DLSS if asked for and it can, else a plain stretch of
+/// the colour input over the output (`crate::stretch`, from
+/// CuteBooty/victory-8gb). With `VICTORY_THIN=1` it is written down with the
+/// list's other calls and recorded by the thread that records them. False if
+/// it could not be recorded or written down.
 #[cfg(windows)]
-pub fn upscale_stretch(
-    this: *const std::ffi::c_void,
-    colour: *const std::ffi::c_void,
-    output: *const std::ffi::c_void,
-    render: [u32; 2],
-) -> bool {
-    const SHADER_READ: u32 = 0x40;
-    const UNORDERED: u32 = 0x8;
-    let (this, colour, output): (This, This, This) = (this.cast(), colour.cast(), output.cast());
-    if this.is_null() || colour.is_null() || output.is_null() {
+pub fn upscale(this: *const std::ffi::c_void, up: &Upscale) -> bool {
+    let this: This = this.cast();
+    if this.is_null() || up.colour == 0 || up.output == 0 {
         return false;
     }
+    if thin::on() {
+        return thin::upscale(this, up);
+    }
+    upscale_now(this, up)
+}
+
+/// [`upscale`], recorded now on the host list behind `this`.
+#[cfg(windows)]
+pub(super) fn upscale_now(this: This, up: &Upscale) -> bool {
+    const SHADER_READ: u32 = 0x40;
+    const UNORDERED: u32 = 0x8;
+    let t = |a: u64| -> This { a as This };
+    let (colour, output) = (t(up.colour), t(up.output));
     let mut done = false;
     with_state(this, |list, state| {
         let (Some(to), Some(from), Some(host)) = (
@@ -839,7 +915,32 @@ pub fn upscale_stretch(
         };
         ensure_state(list, colour, SHADER_READ);
         ensure_state(list, output, UNORDERED);
-        done = crate::stretch::record_stretch(&host.device, &list.list, to, from, render);
+        #[cfg(feature = "dlss")]
+        if up.dlss {
+            let input = |a: u64| {
+                let r = t(a);
+                crate::resource::host_resource(r).inspect(|_| ensure_state(list, r, SHADER_READ))
+            };
+            let inputs = crate::dlss::Inputs {
+                colour: from,
+                depth: input(up.depth),
+                motion: input(up.motion),
+                exposure: input(up.exposure),
+                output: to,
+                jitter: up.jitter,
+                motion_scale: up.motion_scale,
+                render: up.render,
+                reset: up.reset,
+                pre_exposure: up.pre_exposure,
+                near: up.near,
+                far: up.far,
+                frame_ms: up.frame_ms,
+            };
+            done = crate::dlss::record(&host.device, &list.list, &inputs);
+        }
+        if !done {
+            done = crate::stretch::record_stretch(&host.device, &list.list, to, from, up.render);
+        }
         if done {
             crate::texture::host_written(output);
         }

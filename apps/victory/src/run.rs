@@ -187,9 +187,9 @@ pub fn run(
         }
     }
     let take = victory_hle::console::current() == victory_hle::console::Console::SeriesS
-        && std::env::var_os("VICTORY_UPSCALE").is_some_and(|v| v == "stretch");
+        && std::env::var_os("VICTORY_UPSCALE").is_some_and(|v| v == "stretch" || v == "dlss");
     if take {
-        println!("upscale        the title's ffxDispatch is a plain stretch (VICTORY_UPSCALE=stretch)");
+        println!("upscale        the title's ffxDispatch is ours (VICTORY_UPSCALE=stretch|dlss)");
     }
     show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls, take), policy)?);
     if execute {

@@ -151,13 +151,26 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                 }
             }
             #[cfg(windows)]
-            if victory_gpu::list::upscale_stretch(
-                d.list,
-                d.colour.resource,
-                d.output.resource,
-                d.render,
-            ) {
-                return 0;
+            {
+                let up = victory_gpu::list::Upscale {
+                    colour: d.colour.resource as u64,
+                    depth: d.depth.resource as u64,
+                    motion: d.motion.resource as u64,
+                    exposure: d.exposure.resource as u64,
+                    output: d.output.resource as u64,
+                    render: d.render,
+                    jitter: d.jitter,
+                    motion_scale: d.motion_scale,
+                    reset: d.reset != 0,
+                    pre_exposure: d.pre_exposure,
+                    near: d.camera_near,
+                    far: d.camera_far,
+                    frame_ms: d.frame_time_delta,
+                    dlss: std::env::var_os("VICTORY_UPSCALE").is_some_and(|v| v == "dlss"),
+                };
+                if victory_gpu::list::upscale(d.list, &up) {
+                    return 0;
+                }
             }
             if first {
                 tracing::warn!("upscale dispatch not stretched: left to the title's upscaler");
