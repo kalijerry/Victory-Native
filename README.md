@@ -1,4 +1,4 @@
-# Victory AMD
+# Victory Native
 
 A fork of [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (at its
 commit 2de9980), itself a fork of [VIctory](https://github.com/Marvisak/VIctory): a
@@ -8,7 +8,7 @@ upstream; the history, authors and credits of both projects are kept.
 
 ## Translate, don't fake
 
-The founding rule of Victory AMD, for every part of it: rendering, shaders, ray tracing,
+The founding rule of Victory Native, for every part of it: rendering, shaders, ray tracing,
 memory, audio, synchronisation, streaming and system APIs.
 
 - **Translate** the behaviour of the Xbox hardware and APIs into its PC equivalent.
@@ -34,7 +34,7 @@ credited. License: GPL-3.0-or-later, as upstream.
 ## The goal
 
 **The Series X version at 4K output (drawn at 1440p) with ray tracing on,
-looking the way it does on the Xbox**, on AMD RDNA cards (RX 7900 XTX, RX 7800 XT) first.
+looking the way it does on the Xbox**, on AMD RDNA cards (RX 7900 XTX, RX 7800 XT) first, other PC cards next.
 
 In this order:
 

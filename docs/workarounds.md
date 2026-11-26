@@ -1,6 +1,6 @@
 # Workarounds and known defects
 
-Victory AMD shows the title's own picture. Anything that departs from it, whether a stand-in, a
+Victory Native shows the title's own picture. Anything that departs from it, whether a stand-in, a
 setting that shifts timing, or a defect not fixed yet, is listed here with its cause and the way
 out. A workaround is a named switch and is logged when it acts. Nothing that changes the picture
 is on by default unless it is measured identical.

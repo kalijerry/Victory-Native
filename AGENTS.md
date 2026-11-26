@@ -1,4 +1,4 @@
-# AGENTS.md: working in Victory AMD
+# AGENTS.md: working in Victory Native
 
 For everyone who changes this tree, people and AI agents alike. Read [README.md](README.md)
 and [CONTRIBUTING.md](CONTRIBUTING.md) first.

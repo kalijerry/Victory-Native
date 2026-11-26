@@ -1,4 +1,4 @@
-# Contributing to Victory AMD
+# Contributing to Victory Native
 
 Pull requests are welcome from anyone, on any part of the project: shaders, memory, ray
 tracing, audio, synchronisation, streaming, system APIs, tools, Linux, docs. Every pull
