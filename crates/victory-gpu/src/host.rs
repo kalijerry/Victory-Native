@@ -10513,6 +10513,11 @@ mod refresh_tests {
             }
         };
         assert_ne!(at, 0);
+        // Nothing another test's memory at this address left noted is taken
+        // for true of this test's: the runtime tells of its own allocations,
+        // and the tests' raw ones do not, but the suite runs many at once
+        // and the OS hands a freed address back to whoever asks next.
+        crate::watch::title_memory_made_anew(at, len);
         at
     }
 
@@ -10536,6 +10541,8 @@ mod refresh_tests {
                 0,
             ) as usize;
             assert_ne!(at, 0);
+            // As above: the reservation is fresh, the address may not be.
+            crate::watch::title_memory_made_anew(at, blocks * PAGE);
             let len = blocks * PAGE;
             let section =
                 CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null());

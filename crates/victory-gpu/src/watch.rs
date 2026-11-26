@@ -3723,6 +3723,55 @@ fn forget_views(first: usize, last: usize) {
     }
 }
 
+/// Tests only, for memory they make anew at an address the OS may have just
+/// given back to them: nothing another test's memory there left noted (its
+/// blocks, its bits) is taken for true of this test's. The runtime tells of
+/// every such change ([`title_memory_allocated`], [`title_memory_freed`]);
+/// the tests' raw allocations do not, and the suite runs many at once, so a
+/// fresh region can inherit a recycled address's stale notes: a guarded
+/// block skipped as another test's `foreign` one, or view memory the kernel
+/// is never asked about because stale [`PUBLISHED`] bits say it is known by
+/// them. The journal needs no such call: its entries carry asking numbers,
+/// and another test's are always older than this test's.
+///
+/// (`freed_memory_leaves_no_notes` and `unchanged_ranges_are_known` failed
+/// this way in a parallel run: the notes [`guard`] made were not there to be
+/// read back, and 100 retries of one asking all skipped the range the bits
+/// covered.)
+#[cfg(test)]
+pub(crate) fn title_memory_made_anew(at: usize, len: usize) {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if len == 0 || first >= last {
+        return;
+    }
+    let mut g = guards();
+    let drain = |set: &mut Blocks| {
+        for block in set.range(first..last).collect::<Vec<_>>() {
+            set.remove(block);
+        }
+    };
+    drain(&mut g.protected);
+    drain(&mut g.clean);
+    drain(&mut g.absent);
+    drain(&mut g.held);
+    drain(&mut g.aliased);
+    for block in g.foreign.range(first..last).copied().collect::<Vec<_>>() {
+        g.foreign.remove(&block);
+    }
+    g.opened
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|block, _| !(first..last).contains(block));
+    drop(g);
+    // The bits are address-keyed as well, and outlive every owner.
+    for block in first..last {
+        PUBLISHED.clear(block);
+        PROTECTED.clear(block);
+        BESIDE.clear(block);
+    }
+    forget_views(first, last);
+}
+
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
@@ -4085,6 +4134,10 @@ mod tests {
                     0
                 );
             }
+            // The reservation is fresh; the address may have been another
+            // test's the moment it was free, and its notes are not this
+            // placeholder's.
+            title_memory_made_anew(p, blocks * BLOCK);
             p
         }
     }
