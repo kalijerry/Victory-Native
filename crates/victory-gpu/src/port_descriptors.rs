@@ -146,6 +146,12 @@ pub(crate) fn let_go(start: u64) {
     if adopted.as_ref().is_some_and(|a| a.start == start) {
         MARKS.len.store(0, Release);
         *adopted = None;
+        // The fallback's pages are this heap's: in the next one they would be
+        // ranges outside it.
+        let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+        f.pages.clear();
+        f.next = 0;
+        drop(f);
         tracing::info!(start = format_args!("{start:#x}"), "renderer port 2: the marked view heap went");
     }
 }
@@ -578,10 +584,21 @@ mod tests {
         32
     }
 
+    /// The marked heap is one for the process: its tests take turns, each
+    /// with none adopted (a failed one may have left its own).
+    fn one_heap() -> std::sync::MutexGuard<'static, ()> {
+        static ONE_HEAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let one = ONE_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+        MARKS.len.store(0, Release);
+        *ADOPTED.write().unwrap_or_else(|e| e.into_inner()) = None;
+        one
+    }
+
     /// Slots marked as the stores mark them, and by our calls, come out once
     /// each, as runs; outside the heap nothing is marked.
     #[test]
     fn marked_slots_are_taken_once_as_runs() {
+        let _one = one_heap();
         let start = 0x1000_0000u64;
         assert!(adopt_now(start, 1000));
         assert!(adopted(start) && !adopted(start + 32));
@@ -604,5 +621,23 @@ mod tests {
         mark(start + 5 * 32);
         assert!(take(start).is_none());
         assert_eq!(MARKS.len.load(Relaxed), 0);
+    }
+
+    /// Pages the watch told of for a heap that went are not looked at in the
+    /// next marked heap: outside it they made ranges that end before they
+    /// begin (`sync_heaps` underflowed on them).
+    #[test]
+    fn a_heap_that_goes_leaves_no_pages_to_check() {
+        let _one = one_heap();
+        let page = crate::watch::PAGE;
+        let (old, new) = (0x2000_0000usize, 0x3000_0000usize);
+        assert!(adopt_now(old as u64, 4096));
+        asked(&[(old, old + 2 * page)]);
+        let_go(old as u64);
+        assert!(adopt_now(new as u64, 4096));
+        assert_eq!(to_check(0x7e57_0001), []);
+        asked(&[(new + 100, new + 200)]);
+        assert_eq!(to_check(0x7e57_0002), [new]);
+        let_go(new as u64);
     }
 }
