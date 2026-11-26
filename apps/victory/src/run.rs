@@ -204,6 +204,16 @@ pub fn run(
             None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
         }
     }
+    // The simulation's longest step (VICTORY_LONGEST_STEP=<seconds>, off
+    // without it): the title's 1/15 s makes its time run slower than the
+    // wall's below 15 frames a second (`victory_loader::frame_rate`).
+    #[cfg(windows)]
+    if execute && let Some(step) = victory_loader::frame_rate::asked_longest_step() {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        let done = unsafe { victory_loader::frame_rate::apply_longest_step(image.base(), size, step) };
+        println!("simulation: longest step {} s: {done:?}", step.0);
+    }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
     // VICTORY_UPSCALER; each off without it).
     #[cfg(windows)]

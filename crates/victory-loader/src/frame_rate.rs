@@ -182,37 +182,12 @@ pub enum Patched {
 /// The image stays mapped and no thread runs its code yet.
 #[cfg(windows)]
 pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<Patched> {
-    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     sites
         .iter()
         .map(|site| {
             let code = replacement(site.kind, rate);
-            let len = code.len();
-            let done = (|| {
-                if site.bytes.len() < len || site.at.checked_add(site.bytes.len()).is_none_or(|end| end > size) {
-                    return Patched::Failed("outside the image");
-                }
-                let at = base + site.at;
-                // SAFETY: inside the mapped image (checked above).
-                let there = unsafe { std::slice::from_raw_parts(at as *const u8, site.bytes.len()) };
-                if there != site.bytes {
-                    return Patched::Differs;
-                }
-                let mut old = 0;
-                // SAFETY: the load's bytes, made writable for this and put
-                // back; nothing runs them yet.
-                unsafe {
-                    if VirtualProtect(at as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
-                        return Patched::Failed("Windows would not make it writable");
-                    }
-                    std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, len);
-                    VirtualProtect(at as *const _, len, old, &mut old);
-                    FlushInstructionCache(GetCurrentProcess(), at as *const _, len);
-                }
-                Patched::Done
-            })();
+            // SAFETY: as this function's.
+            let done = unsafe { write(base, size, site.at, site.bytes, &code) };
             let offset = format_args!("{:#x}", site.at);
             match done {
                 Patched::Done => tracing::info!(site = %offset, kind = ?site.kind, rate, "frame rate: the title's read of its frame rate setting patched (VICTORY_FRAME_INTERVAL_MS)"),
@@ -222,6 +197,154 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
             done
         })
         .collect()
+}
+
+/// Puts `code` at `at` in the image of `size` bytes at `base` if the bytes
+/// there are `bytes` (`code` no longer than them).
+///
+/// # Safety
+/// The image stays mapped and no thread runs its code yet.
+#[cfg(windows)]
+unsafe fn write(base: usize, size: usize, at: usize, bytes: &[u8], code: &[u8]) -> Patched {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let len = code.len();
+    if bytes.len() < len || at.checked_add(bytes.len()).is_none_or(|end| end > size) {
+        return Patched::Failed("outside the image");
+    }
+    let at = base + at;
+    // SAFETY: inside the mapped image (checked above).
+    let there = unsafe { std::slice::from_raw_parts(at as *const u8, bytes.len()) };
+    if there != bytes {
+        return Patched::Differs;
+    }
+    let mut old = 0;
+    // SAFETY: the site's bytes, made writable for this and put back;
+    // nothing runs them yet.
+    unsafe {
+        if VirtualProtect(at as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return Patched::Failed("Windows would not make it writable");
+        }
+        std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, len);
+        VirtualProtect(at as *const _, len, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), at as *const _, len);
+    }
+    Patched::Done
+}
+
+// The simulation's longest step (`VICTORY_LONGEST_STEP=<seconds>`, off
+// without it).
+//
+// +0x2226040 makes each timer's step of the real time since the last frame:
+// at most 1/15 s (+0x6159ec0), at least `1 / rate`. Below 15 frames a second
+// the title's time therefore runs slower than the clock on the wall: at 7
+// frames a second (143 ms) it moves 66.7 ms a frame, less than half. Sound
+// plays on at its own pace, and cutscenes, kept to it, go back and forth
+// (seen as the picture jumping back a second, then forward). The console
+// never runs that slowly; a port that does runs its time at the wall's pace
+// up to a longer step instead.
+//
+// The step's ceiling is a load of that constant, shared with 64 other
+// reads, so it is not changed: the load (`vmovss xmm3, [rip+d]`, 8 bytes)
+// reads another constant of the title's read-only data, one of
+// [`STEPS`], whose value is compared first like the load's bytes.
+
+/// The load of the ceiling in +0x2226040 and its bytes.
+pub const STEP_LOAD_AT: usize = 0x2226045;
+pub const STEP_LOAD: [u8; 8] = [0xc5, 0xfa, 0x10, 0x1d, 0x73, 0x3e, 0xf3, 0x03];
+/// Constants of the title's read-only data the load can read instead: the
+/// seconds and where they are (image offsets). The first is its own.
+pub const STEPS: [(f32, usize); 5] = [
+    (1.0 / 15.0, 0x6159ec0),
+    (0.1, 0x5fc7020),
+    (0.125, 0x615a6b8),
+    (0.2, 0x6159f8c),
+    (0.25, 0x6159ca4),
+];
+
+/// The switch: the longest step asked for, one of [`STEPS`] (`None` if
+/// unset, or not one of them: said why).
+pub fn asked_longest_step() -> Option<(f32, usize)> {
+    let spec = std::env::var("VICTORY_LONGEST_STEP").ok()?;
+    let step = longest_step(&spec);
+    if step.is_none() {
+        eprintln!(
+            "VIctory: VICTORY_LONGEST_STEP={spec}: expected one of 0.1, 0.125, 0.2, 0.25 (seconds)"
+        );
+    }
+    step
+}
+
+/// `0.25` → the constant of 0.25 s; only the title's own constants.
+pub fn longest_step(spec: &str) -> Option<(f32, usize)> {
+    let secs = spec.trim().parse::<f32>().ok()?;
+    STEPS.iter().copied().find(|(s, _)| (s - secs).abs() < 1e-6)
+}
+
+/// The load of the ceiling made to read the constant at `target`.
+pub fn step_load(target: usize) -> [u8; 8] {
+    let disp = (target as i64 - (STEP_LOAD_AT + STEP_LOAD.len()) as i64) as i32;
+    let d = disp.to_le_bytes();
+    [
+        STEP_LOAD[0],
+        STEP_LOAD[1],
+        STEP_LOAD[2],
+        STEP_LOAD[3],
+        d[0],
+        d[1],
+        d[2],
+        d[3],
+    ]
+}
+
+/// Makes the simulation's step at most `step` seconds: the load of its
+/// ceiling ([`STEP_LOAD`] at [`STEP_LOAD_AT`]) reads the constant at
+/// `target`, once it holds `step`. Said in the log.
+///
+/// # Safety
+/// The image stays mapped and no thread runs its code yet.
+#[cfg(windows)]
+pub unsafe fn apply_longest_step(base: usize, size: usize, step: (f32, usize)) -> Patched {
+    // SAFETY: as this function's.
+    unsafe { apply_longest_step_at(base, size, STEP_LOAD_AT, &STEP_LOAD, step) }
+}
+
+/// [`apply_longest_step`] for a load at `at` whose bytes are `bytes`.
+///
+/// # Safety
+/// As [`apply_longest_step`]'s.
+#[cfg(windows)]
+unsafe fn apply_longest_step_at(
+    base: usize,
+    size: usize,
+    at: usize,
+    bytes: &[u8; 8],
+    (step, target): (f32, usize),
+) -> Patched {
+    let holds = target.checked_add(4).is_some_and(|end| end <= size)
+        // SAFETY: inside the mapped image (checked).
+        && unsafe { (base as *const u8).add(target).cast::<f32>().read_unaligned() } == step;
+    let disp = (target as i64 - (at + bytes.len()) as i64) as i32;
+    let mut code = *bytes;
+    code[4..].copy_from_slice(&disp.to_le_bytes());
+    let done = if holds {
+        // SAFETY: as this function's.
+        unsafe { write(base, size, at, bytes, &code) }
+    } else {
+        Patched::Differs
+    };
+    match done {
+        Patched::Done => tracing::info!(
+            step,
+            "simulation: the longest step is {step} s (VICTORY_LONGEST_STEP; the title's own is 1/15 s)"
+        ),
+        Patched::Differs => tracing::warn!(
+            "simulation: the longest step not changed, the title's bytes are not the ones expected (another build?)"
+        ),
+        Patched::Failed(why) => tracing::warn!(why, "simulation: the longest step not changed"),
+    }
+    done
 }
 
 #[cfg(test)]
@@ -332,5 +455,74 @@ mod tests {
             assert_eq!(rate(), 60.0);
             VirtualFree(place.cast(), 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn longest_steps() {
+        assert_eq!(longest_step("0.25"), Some((0.25, 0x6159ca4)));
+        assert_eq!(longest_step(" 0.1 "), Some((0.1, 0x5fc7020)));
+        assert_eq!(longest_step("0.3"), None);
+        assert_eq!(longest_step("long"), None);
+        // The load as the title has it reads its own 1/15 s.
+        assert_eq!(step_load(STEPS[0].1), STEP_LOAD);
+        let load = step_load(0x6159ca4);
+        assert_eq!(&load[..4], &STEP_LOAD[..4]);
+        assert_eq!(
+            i32::from_le_bytes(load[4..].try_into().unwrap()),
+            0x6159ca4 - 0x222604d
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_step_load_reads_the_constant_asked_for() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: fresh memory of our own, written and run inside it.
+        unsafe {
+            let place = VirtualAlloc(
+                std::ptr::null(),
+                0x10000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            ) as *mut u8;
+            assert!(!place.is_null());
+            // At 0x100: vmovss xmm3, [rip+d] reading 1/15 at 0x800; vmovaps
+            // xmm0, xmm3; ret. 0.25 at 0x900, 0.2 at 0xa00.
+            let own = 0x800usize;
+            let mut load = STEP_LOAD;
+            load[4..].copy_from_slice(&((own as i32) - 0x108).to_le_bytes());
+            let mut f = load.to_vec();
+            f.extend([0xc5, 0xf8, 0x28, 0xc3, 0xc3]);
+            std::ptr::copy_nonoverlapping(f.as_ptr(), place.add(0x100), f.len());
+            place.add(own).cast::<f32>().write_unaligned(1.0 / 15.0);
+            place.add(0x900).cast::<f32>().write_unaligned(0.25);
+            place.add(0xa00).cast::<f32>().write_unaligned(0.5);
+            let step: extern "system" fn() -> f32 =
+                std::mem::transmute::<*mut u8, extern "system" fn() -> f32>(place.add(0x100));
+            assert_eq!(step(), 1.0 / 15.0);
+            // A constant that does not hold the step asked for: left alone.
+            let mut bytes = STEP_LOAD;
+            bytes[4..].copy_from_slice(&load[4..]);
+            assert_eq!(
+                apply_longest_step_with(place as usize, &bytes, (0.2, 0xa00)),
+                Patched::Differs
+            );
+            assert_eq!(step(), 1.0 / 15.0);
+            assert_eq!(
+                apply_longest_step_with(place as usize, &bytes, (0.25, 0x900)),
+                Patched::Done
+            );
+            assert_eq!(step(), 0.25);
+            VirtualFree(place.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    /// `apply_longest_step` on a load at 0x100 whose bytes are `bytes`.
+    #[cfg(windows)]
+    unsafe fn apply_longest_step_with(base: usize, bytes: &[u8; 8], step: (f32, usize)) -> Patched {
+        // SAFETY: the caller's memory.
+        unsafe { apply_longest_step_at(base, 0x10000, 0x100, bytes, step) }
     }
 }
