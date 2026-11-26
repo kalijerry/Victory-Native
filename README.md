@@ -6,28 +6,30 @@ compatibility layer that runs an Xbox Series title natively on Windows from file
 user supplies. Everything below this section up to "The goal" is unchanged from
 upstream; the history, authors and credits of both projects are kept.
 
-## Why this fork, and its rules
+## Translate, don't fake
 
-Victory AMD follows the same goal (below) with a stricter direction:
+The founding rule of Victory AMD, for every part of it: rendering, shaders, ray tracing,
+memory, audio, synchronisation, streaming and system APIs.
 
-- **The title's own picture, nothing added, nothing hidden.** No stand-in light, no
-  clamping, blur or masking to make a frame look better. A defect is fixed at its
-  cause, or it stays visible and listed in [docs/workarounds.md](docs/workarounds.md).
-- **No picture traded for frame rate in silence.** A change that alters the picture is
-  opt-in until it is measured identical.
-- **Every temporary workaround is a named switch,** logged when it acts and listed with
-  its cause and the way out.
-- **Measured, reproducible changes:** each merge says what it was measured on, before
-  and after, picture and frame time.
-- **Porting, not emulating:** the PC-native path (in-place memory, the card's own ray
-  tracing, D3D12) over compatibility layers that copy and watch the console's memory
-  every frame.
-- **Open to contributions.** Open pull requests from upstream are reviewed here in the open
-  ([CONTRIBUTING.md](CONTRIBUTING.md)), with their authors credited and asked when something
-  is unclear. Upstream is followed and its changes are taken one by one
-  (`git cherry-pick -x`) when they meet these rules.
+- **Translate** the behaviour of the Xbox hardware and APIs into its PC equivalent.
+- Where no native equivalent exists, **reproduce the semantics**.
+- **Never invent a result** to hide a feature that is wrong or missing: no stand-in light, no
+  value, success code or texture made up.
+- **Never mistake a visual enhancement for a renderer fix.**
+- **Fix root causes.** A temporary workaround exists only to diagnose or to unblock an
+  investigation: optional, off by default, documented, and stated in the log when it acts.
+- **Optimise the implementation without changing what the game is meant to do.**
+- **A problem is fixed when measurements show it,** not before.
+- **Never hide an error, a crash, an incompatibility or a regression.**
 
-License: GPL-3.0-or-later, as upstream.
+How contributions are reviewed: [CONTRIBUTING.md](CONTRIBUTING.md). Rules for people and
+agents working in the tree: [AGENTS.md](AGENTS.md). What departs from the console today:
+[docs/workarounds.md](docs/workarounds.md) and the audit of inherited shortcuts,
+[docs/shortcuts-audit.md](docs/shortcuts-audit.md).
+
+Upstream is followed. Its changes are taken one by one (`git cherry-pick -x`) when they meet
+these rules, and its open pull requests are reviewed here in the open, with their authors
+credited. License: GPL-3.0-or-later, as upstream.
 
 ## The goal
 
@@ -53,39 +55,38 @@ ray tracing off stay available.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-26)
+## Where it stands (measured, 2026-11-26)
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, renderer patches 1, 2, 5, 6 and 7 on. Runs of 270 s in a city
-street: standing still, then walking and turning the camera.
+Measured by this fork on one machine: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
+RX 7800 XT 16 GB. Series X profile, 4K output drawn at 1440p, ray tracing on
+(`VICTORY_BVH_BUILDER=1`), renderer patches 1, 2, 5, 6 and 7 on, warm pipeline cache, the
+same save and scripted input each run, last 90 s of a 480 s run in a boat scene:
+
+| Build | Frame | Limited by |
+|---|---|---|
+| 2de9980 (this fork's base) | 103-116 ms (8.7-9.8 fps) over two runs | the CPU: the card is busy 60-85% of the frame |
+| base + #363 and #364 (in review here) | 90 ms (11.1 fps), one run | the CPU |
+
+**30 fps with ray tracing is far away.** What sets the frame is the thread that prepares
+the title's submissions for the card. The goal is to cut that work by porting, not by
+dropping any of it.
+
+Known to be wrong, with causes where known: [docs/workarounds.md](docs/workarounds.md).
+In short: trees flicker at the start of shots, lamp-lit rooms flicker, shallow water shows
+striped artefacts, models stay at low detail for long while the title streams, and ray-traced
+structures of moving objects are partly corrupt.
+
+Upstream's own measurements (RX 7900 XTX, a city street, not reproduced here):
 
 | Version | Standing | Walking | RAM |
 |---|---|---|---|
-| **Series X, 4K drawn at 1440p, ray tracing on (the goal)** | 99 ms (10 fps) | ~110 ms (9 fps) | 45 GB |
+| Series X, 4K drawn at 1440p, ray tracing on | 99 ms (10 fps) | ~110 ms (9 fps) | 45 GB |
 | Series X, 4K drawn at 1440p, ray tracing off | 49 ms (20 fps) | ~62 ms (16 fps) | 45 GB |
 | Series X, 1080p output, ray tracing off | 40 ms (25 fps) | ~43 ms (23 fps) | 42 GB |
 | Series S, ray tracing off | 43 ms (23 fps) | ~64 ms (16 fps) | 37 GB |
 
-Known problems with ray tracing on, being worked on now: lighting flickers and
-swings between too dark and too bright even when nothing moves; dark rooms and
-backgrounds; models and textures stay at their lowest detail for a long time
-while the title streams (worst in the intro); trees flicker.
-
-Earlier measurements with ray tracing off:
-
-| | |
-|---|---|
-| City street, Series S profile, renderer patches 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
-| Same, patches 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
-| Same, patches 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
-| Series X profile, patches 1+2 | about 53 ms (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
-| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 30 GB of private memory, 10.5 GB of VRAM: **64 GB of RAM recommended** for now |
-
-It started at 280 ms a frame in the same scenes three days earlier. What sets
-the frame now is the one thread that submits the title's work to the card
-(about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
+Memory: about 30-45 GB of private memory and over 10 GB of VRAM; **64 GB of RAM is needed**
+for now.
 
 ### Renderer patches (off by default while they are tested)
 
@@ -104,18 +105,11 @@ the frame now is the one thread that submits the title's work to the card
 | `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
 | `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
-| `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
 
-What is known to be wrong:
-
-- Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+The first run of a new build stutters while the driver makes pipelines; `victory warm` makes
+them ahead. Until a pipeline exists, the draws that need it are dropped and counted in the log
+(listed in [docs/workarounds.md](docs/workarounds.md)).
 
 ## How to run it
 
@@ -176,7 +170,10 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
 
 ## Credits
 
-This is a tree of other people's work with more on top. The history is kept, and
+This is a tree of other people's work with more on top.
+
+- **[VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** by avatarmanz and its
+  contributors: everything up to 2de9980, this fork's base, and the pull requests reviewed here. The history is kept, and
 commits taken from elsewhere name the commit and its author.
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its

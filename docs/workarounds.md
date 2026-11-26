@@ -31,3 +31,21 @@ its rays find nothing. The fix is the ray tracing (`VICTORY_BVH_BUILDER=1`), not
 | shallow water shows regular dark stripes with stepped edges, cut by a straight line | boat ride after the cutscene | likely a texture read with a wrong mip, format or tiling; open |
 | models and textures stay at low detail for long | intro | the title paces streaming by its own frames: about 3x slower at 10 fps than at 30 |
 | ray-traced structures of moving objects partly corrupt | everywhere with ray tracing | ~450 stray pointers a frame followed by the rays (upstream finding) |
+
+## Inherited behaviours that invent a result (on by default; to replace)
+
+Found in the upstream code at 2de9980. Each one breaks "translate, don't fake" and is to be
+replaced by a real implementation. Until then it stays listed here, and the log must say when
+it acts.
+
+| where | what it does today | why it is not faithful | the real implementation |
+|---|---|---|---|
+| `host.rs` frame line, `draw.rs` "a dispatch without a host pipeline dropped" | a draw or dispatch whose host pipeline is not made yet is dropped (counted per frame in the log) | the frame is drawn without work the title asked for: missing objects, wrong passes | have every pipeline before its first use: `victory warm` ahead, and when one is missing, wait for it within a budget (upstream #303) and log the wait |
+| `list.rs` `ValueWait` | a wait on a value with an unknown comparison code, or on memory that is not mapped, counts as met | a wait the console would hold is let through: work runs before its input exists | decode every comparison code the console has; treat unmapped memory as an error and log it |
+| `draw.rs` root views | a root view has no size, so constant buffers are taken as 64 KiB and other views as the rest of their buffer | an assumption about how far a shader reads, not what the console does | the console reads through an address with no bound: derive the reach from the shader's accesses, or map the title's memory in place (renderer port 1) |
+| `descriptor/host.rs` `VICTORY_TEXTURE_AWAY_MS` | a texture whose memory is no longer mapped becomes a null view (reads zeros) | an unmapped texture on the console is a title bug or a streaming race, not black texels | log each case with the texture and the title's mapping calls; keep the last mapped contents only if the console's memory system would |
+| `ambient.rs` (`VICTORY_AMBIENT*`) | stand-in indirect light; off by default here | light the title does not draw | ray tracing (`VICTORY_BVH_BUILDER=1`) |
+
+Beyond these, the code marks 167 places of its own as `shortcut:` (narrower semantics than the
+console). They are listed one by one in [shortcuts-audit.md](shortcuts-audit.md) to be classified
+as FAKE, APPROXIMATION or OK and replaced in turn.
