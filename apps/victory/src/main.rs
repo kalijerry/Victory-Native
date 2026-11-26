@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod launch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -138,6 +140,10 @@ enum Command {
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
+        /// A line a step for a launcher to show (`plan`, `made`, `failed`,
+        /// `over`), besides the summary.
+        #[arg(long)]
+        progress: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -228,7 +234,9 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, these, progress } => {
+            warm::run(jobs, limit, again, used, these, progress)
+        }
         Command::Run {
             exe,
             unimplemented,

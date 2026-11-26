@@ -153,7 +153,26 @@ pub extern "system" fn CreateWindowExA(
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
+/// Where the launcher's loading window is (`victory` `launch.rs`): the title's
+/// top-level windows are put there, so that its window takes the loading
+/// window's place. Only the place: the size is the title's, fitted as below.
+static LAUNCH_PLACE: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+/// See [`LAUNCH_PLACE`].
+pub fn place_title_windows_at(x: i32, y: i32) {
+    *LAUNCH_PLACE.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y));
+}
+
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    let (x, y, width, height) = fit_to_screen(parent, x, y, width, height);
+    let launch = *LAUNCH_PLACE.lock().unwrap_or_else(|e| e.into_inner());
+    match launch {
+        Some((lx, ly)) if parent.is_null() => (lx, ly, width, height),
+        _ => (x, y, width, height),
+    }
+}
+
+fn fit_to_screen(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =

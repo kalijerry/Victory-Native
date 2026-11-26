@@ -49,6 +49,9 @@ pub fn run(
 
     if execute {
         check_cpu_features()?;
+        // The loading screen: the pipelines earlier runs drew with are made
+        // before the title starts (VICTORY_LAUNCH_WARM).
+        crate::launch::prepare()?;
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();

@@ -1,5 +1,5 @@
-//! Every pipeline the title has ever created, kept on disk
-//! (`VICTORY_PIPELINE_BOOK=1`), and their host pipelines made ahead of a run
+//! Every pipeline the title has ever created, kept on disk (on by default;
+//! `VICTORY_PIPELINE_BOOK=0` keeps nothing), and their host pipelines made ahead of a run
 //! (`victory warm`), so that the driver's own cache on disk has them before
 //! a draw asks for one.
 //!
@@ -39,10 +39,15 @@ const PIPELINES: &str = "known-pipelines.bin";
 const STAGES: [&str; 8] =
     ["vertex", "pixel", "domain", "hull", "geometry", "compute", "amplification", "mesh"];
 
-/// `VICTORY_PIPELINE_BOOK=1`: the pipelines the title creates are kept.
+/// The pipelines the title creates are kept, so that the launcher makes them
+/// before the next run (`victory warm`); `VICTORY_PIPELINE_BOOK=0`: not kept.
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BOOK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| book_on(std::env::var("VICTORY_PIPELINE_BOOK").ok().as_deref()))
+}
+
+fn book_on(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 struct Book {
@@ -467,6 +472,14 @@ impl GraphicsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_book_is_kept_unless_turned_off() {
+        assert!(book_on(None));
+        assert!(book_on(Some("1")));
+        assert!(!book_on(Some("0")));
+        assert!(!book_on(Some(" 0 ")));
+    }
 
     #[test]
     fn failed_open_retries_before_later_records() {

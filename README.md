@@ -110,9 +110,24 @@ for now.
 | `VICTORY_BORDERLESS=1` | The window covers the primary display with no border or title bar (windowed borderless: the picture is stretched to it, the render size stays; `play.ps1 -Borderless`) |
 | `VICTORY_PORT_BVH_ARENA_WRITES=1` | Records CPU writes into private BVH arenas and refreshes them from the journal. Off by default. |
 
-The first run of a new build stutters while the driver makes pipelines; `victory warm` makes
-them ahead. Until a pipeline exists, the draws that need it are dropped and counted in the log
-(listed in [docs/workarounds.md](docs/workarounds.md)).
+Pipelines are made before the title starts. `victory run --execute` opens a Victory Native
+window with a loading screen and makes the host pipelines earlier runs drew with (the same work as
+`victory warm --used`, in processes of their own); the title then starts and its window takes the
+loading window's place. Only pipelines that are new, or made under another translator or driver,
+are made; failures are shown and logged, kept in `warm-bad.txt` and tried again once the
+translator or the driver changes (`victory warm --again` tries them now). Nothing of it runs once
+the title has started. The pipelines the title creates are written down for this by default
+(`VICTORY_PIPELINE_BOOK=0`: not kept).
+
+| Switch | What it does |
+|---|---|
+| `VICTORY_LAUNCH_WARM=used` | Default: the loading screen makes the pipelines earlier runs drew with |
+| `VICTORY_LAUNCH_WARM=all` | Every pipeline the title ever created (84,000: long the first time) |
+| `VICTORY_LAUNCH_WARM=0` | No loading screen; pipelines are made when a draw first needs them |
+
+A pipeline met for the first time in a run is still made when a draw needs it. Until it exists,
+the draws that need it are dropped and counted in the log (listed in
+[docs/workarounds.md](docs/workarounds.md)).
 
 ## How to run it
 
@@ -141,11 +156,12 @@ name, PCI vendor and device IDs, and dedicated VRAM. Set
 name to select it explicitly. With the launcher, pass
 `-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
 
-Before the first run, ahead of time (both can be stopped and go on later):
+The loading screen does the pipelines; for diagnostics and scripts the commands stay (both can
+be stopped and go on later):
 
 ```powershell
 target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+target\diag\victory.exe warm --used                     # what the loading screen does, on the command line
 ```
 
 Commands, debugging switches and upstream's own description:

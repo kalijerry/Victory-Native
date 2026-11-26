@@ -26,7 +26,18 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+/// `progress`: one line a step for whoever started this process (the
+/// launcher's loading screen, [`crate::launch`]), as well as the summary:
+/// `plan <to make> <known> <made before> <failed before>`, `made <key>` or
+/// `failed <key> <why>` for each, then `over`.
+pub fn run(
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    again: bool,
+    used: bool,
+    these: Option<String>,
+    progress: bool,
+) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
@@ -46,15 +57,19 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             done.insert(key);
         }
     }
-    let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    // A pipeline that failed is tried again once the translator or the driver
+    // changed (another fingerprint), or with `--again`: a fix of the translator
+    // is enough for it to be made. (Lines of before fingerprints were kept:
+    // `key why`; those are tried again once.)
+    let failed = std::fs::read_to_string(&bad_file).unwrap_or_default();
+    let bad = failed_with(&failed, &fingerprint);
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
     // Those earlier runs drew with first, the others in no order (by key).
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
-            (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
+            (again || (!done.contains(key) && !bad.contains(key))) && (!used || early.contains(key))
         })
         .collect();
     all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
@@ -62,12 +77,20 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
     println!(
-        "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
+        "{} pipelines known, {} made before ({fingerprint}), {} failed before with it; {} to make, {jobs} processes",
         keys.len(),
         done.len(),
         bad.len(),
         all.len()
     );
+    let tell = |line: std::fmt::Arguments| {
+        if progress {
+            let mut out = std::io::stdout().lock();
+            // Whoever reads it is gone: the pipelines are made all the same.
+            let _ = writeln!(out, "{line}").and_then(|()| out.flush());
+        }
+    };
+    tell(format_args!("plan {} {} {} {}", all.len(), keys.len(), done.len(), bad.len()));
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
     let done_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&done_file)?);
     // (Read back by the runs: these are made beside the others, not before.)
@@ -78,6 +101,15 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         jobs,
         start_worker,
         |n, ms, there| {
+            if !there {
+                // The translator or the host refused it: a failure, named.
+                let why = "no host pipeline (the translation or the pipeline was refused; the log of a run names why)";
+                println!("pipeline {n} {}: {why}", keys[n]);
+                tell(format_args!("failed {} {why}", keys[n]));
+                let _ = writeln!(lock(&bad_out), "{fingerprint} {} {why}", keys[n]);
+            } else {
+                tell(format_args!("made {}", keys[n]));
+            }
             if ms >= SLOW_MS {
                 let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
             }
@@ -89,11 +121,14 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
             }
             drop(state);
-            let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+            if there {
+                let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+            }
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+            tell(format_args!("failed {} {why}", keys[n]));
+            let _ = writeln!(lock(&bad_out), "{fingerprint} {} {why}", keys[n]);
             lock(&state).2 += 1;
         },
     )?;
@@ -110,7 +145,23 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         times.last().copied().unwrap_or(0.0),
         times.iter().sum::<f64>() / 1e3
     );
+    if refused + crashed > 0 {
+        println!("failures are listed in {} and tried again after a change of the translator or driver (or with --again)", bad_file.display());
+    }
+    tell(format_args!("over"));
     Ok(())
+}
+
+/// The keys `warm-bad.txt` (`fingerprint key why` a line) has as failed with
+/// this `fingerprint`.
+fn failed_with<'a>(listed: &'a str, fingerprint: &str) -> HashSet<&'a str> {
+    listed
+        .lines()
+        .filter_map(|l| {
+            let mut words = l.split(' ');
+            (words.next()? == fingerprint).then(|| words.next()).flatten()
+        })
+        .collect()
 }
 
 fn run_batches(
@@ -261,6 +312,18 @@ mod tests {
             .stdout(stdout)
             .stderr(Stdio::null())
             .spawn()?)
+    }
+
+    #[test]
+    fn failures_are_tried_again_under_another_fingerprint() {
+        let listed = "aaaa k1 hung for 180 s
+bbbb k2 exit code: 1
+k3 an old line
+aaaa k4 no host pipeline";
+        let bad = failed_with(listed, "aaaa");
+        assert_eq!(bad, HashSet::from(["k1", "k4"]));
+        // A new translator or driver: none of them is held back.
+        assert!(failed_with(listed, "cccc").is_empty());
     }
 
     #[test]

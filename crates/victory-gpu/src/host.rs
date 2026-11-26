@@ -9929,15 +9929,20 @@ impl Host {
 }
 
 /// A visible top-level window of this process: the one the title made, if
-/// it made one.
+/// it made one. Not the launcher's loading window (`victory` `launch.rs`),
+/// which goes when the title's shows.
 fn title_window() -> Option<HWND> {
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
+        let mut class = [0u16; 64];
         // SAFETY: a window handle from the enumeration; `found` is ours.
         unsafe {
             GetWindowThreadProcessId(hwnd, Some(&mut process));
+            let n = GetClassNameW(hwnd, &mut class).max(0) as usize;
+            let loading = String::from_utf16_lossy(&class[..n]) == "VictoryNativeLoading";
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
+                && !loading
             {
                 *(found.0 as *mut Option<HWND>) = Some(hwnd);
                 return false.into();
