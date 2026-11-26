@@ -124,6 +124,238 @@ impl Made {
     }
 }
 
+/// Free dynamic slots, kept as runs so that a table gets the smallest run
+/// that holds it, and a given back run joins its neighbours.
+///
+/// A plain bit scan from a cursor (as it was) walks the whole ring once the
+/// pool has no run of the length asked: with thousands of slots free but
+/// only in pieces, every such table walked them all under the lock every
+/// recording thread needs, and the shortest length that found nothing
+/// refused every longer table for the rest of the frame. In the world
+/// (RTX 3080, 30 s sample) that was 2,800 draws a frame dropped with
+/// thousands of slots free, and 0.3-0.4 s a frame spent searching.
+struct Pool {
+    /// Which slots are taken (for the slot story).
+    taken: Vec<bool>,
+    /// Free runs by start, and the same runs by length then start: the
+    /// smallest run that holds a table is the first of the lengths from
+    /// that table's own length up.
+    at: std::collections::BTreeMap<usize, usize>,
+    by_len: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
+    end: usize,
+}
+
+impl Pool {
+    fn new(n: usize) -> Self {
+        let mut by_len = std::collections::BTreeMap::new();
+        if n != 0 {
+            by_len.insert(n, std::collections::BTreeSet::from([0]));
+        }
+        Self { taken: vec![false; n], at: if n == 0 { Default::default() } else { [(0, n)].into() }, by_len, end: n }
+    }
+
+    fn free(&self) -> u32 {
+        self.at.values().sum::<usize>() as u32
+    }
+
+    fn add(&mut self, start: usize, len: usize) {
+        self.at.insert(start, len);
+        self.by_len.entry(len).or_default().insert(start);
+    }
+
+    fn remove(&mut self, start: usize, len: usize) {
+        self.at.remove(&start);
+        if let Some(starts) = self.by_len.get_mut(&len) {
+            starts.remove(&start);
+            if starts.is_empty() {
+                self.by_len.remove(&len);
+            }
+        }
+    }
+
+    /// `n` consecutive free slots: the first of the smallest run that holds
+    /// them.
+    fn take(&mut self, n: usize) -> Option<usize> {
+        let (&len, starts) = self.by_len.range(n..).next()?;
+        let start = *starts.first()?;
+        self.remove(start, len);
+        if len > n {
+            self.add(start + n, len - n);
+        }
+        self.taken[start..start + n].fill(true);
+        Some(start)
+    }
+
+    /// The last free run, and the first: for a table bigger than a shard.
+    fn last_run(&self) -> Option<(usize, usize)> {
+        let (&at, &len) = self.at.iter().next_back()?;
+        Some((at, len))
+    }
+
+    fn first_run(&self) -> Option<(usize, usize)> {
+        let (&at, &len) = self.at.iter().next()?;
+        Some((at, len))
+    }
+
+    /// Takes `n` of the run at `start` (whose length [`Pool::at`] has).
+    fn take_at(&mut self, start: usize, n: usize) {
+        let len = self.at[&start];
+        self.remove(start, len);
+        if len > n {
+            self.add(start + n, len - n);
+        }
+        self.taken[start..start + n].fill(true);
+    }
+
+    /// Gives back `n` slots from `start`, joining the free runs before and
+    /// after so that a run cut into pieces is whole again. How many of them
+    /// were taken.
+    fn give(&mut self, start: usize, n: usize) -> u32 {
+        let end = (start + n).min(self.end);
+        let (mut lo, mut hi) = (start, end.max(start));
+        while lo > 0 && !self.taken[lo - 1] {
+            let Some((&at, &len)) = self.at.range(..lo).next_back() else { break };
+            if at + len != lo {
+                break;
+            }
+            self.remove(at, len);
+            lo = at;
+        }
+        while hi < self.end && !self.taken[hi] {
+            let Some((&at, &len)) = self.at.range(hi..).next() else { break };
+            if at != hi {
+                break;
+            }
+            self.remove(at, len);
+            hi += len;
+        }
+        let given = self.taken[start..end].iter().filter(|taken| **taken).count() as u32;
+        self.taken[start..end].fill(false);
+        if hi > lo {
+            self.add(lo, hi - lo);
+        }
+        given
+    }
+}
+
+/// The pool cut into shards, each with its own lock: every recording thread
+/// takes dynamic slots for the tables of its draws, and one lock for all of
+/// them was taken 14,000 times a frame and waited for (a best fit search
+/// under it went from 13 ms a frame at 2,800 refused tables to 49 ms at
+/// none). Requests start at a shard that turns over, so threads spread
+/// instead of queueing; a request that finds no run in its first shard goes
+/// to the others, and the total free count is looked at first so a full pool
+/// is refused without any search at all. Tables bigger than a shard (rare:
+/// most are one slot) take whole runs off the end of one shard and the
+/// starts of the ones after it, under a lock of their own.
+struct Pools {
+    shards: Box<[Mutex<Pool>]>,
+    /// Slots in each shard (the last takes the rest).
+    size: usize,
+    next: std::sync::atomic::AtomicUsize,
+    /// For the runs that have to span shards.
+    wide: Mutex<()>,
+}
+
+impl Pools {
+    const SHARDS: usize = 8;
+
+    fn new(n: usize) -> Self {
+        // (Round up: the shards must cover every slot, the last a little less.)
+        let size = n.div_ceil(Self::SHARDS).max(1);
+        let mut left = n;
+        let shards = (0..Self::SHARDS)
+            .map(|_| {
+                let take = left.min(size);
+                left -= take;
+                Mutex::new(Pool::new(take))
+            })
+            .collect();
+        Self { shards, size, next: Default::default(), wide: Mutex::new(()) }
+    }
+
+    fn free(&self) -> u32 {
+        self.shards.iter().map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).free()).sum()
+    }
+
+    /// `n` consecutive free slots, the smallest run that holds them: the
+    /// first's index past the title's slots.
+    fn take(&self, n: usize) -> Option<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if n == 0 {
+            return None;
+        }
+        if n > self.size {
+            return self.take_wide(n);
+        }
+        let first = self.next.fetch_add(1, Relaxed) % self.shards.len();
+        for i in 0..self.shards.len() {
+            let shard = (first + i) % self.shards.len();
+            let mut pool = self.shards[shard].lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(local) = pool.take(n) {
+                return Some(shard * self.size + local);
+            }
+        }
+        None
+    }
+
+    /// A table bigger than a shard: whole runs off the end of one shard and
+    /// the starts of the ones after it.
+    fn take_wide(&self, n: usize) -> Option<usize> {
+        let _wide = self.wide.lock().unwrap_or_else(|e| e.into_inner());
+        let mut got: Vec<(usize, usize)> = Vec::new();
+        for shard in 0..self.shards.len() {
+            let mut need = n;
+            let mut at = shard;
+            let mut start = 0;
+            let mut spans = Vec::new();
+            while need > 0 && at < self.shards.len() {
+                let mut pool = self.shards[at].lock().unwrap_or_else(|e| e.into_inner());
+                let Some((local, have)) = (if at == shard { pool.last_run() } else { pool.first_run() }) else { break };
+                let take = have.min(need);
+                pool.take_at(local, take);
+                if at == shard {
+                    start = local;
+                }
+                spans.push((at * self.size + local, take));
+                need -= take;
+                at += 1;
+            }
+            if need == 0 {
+                return Some(shard * self.size + start);
+            }
+            // (Not this one: what it took goes back.)
+            for (at, len) in spans {
+                got.push((at, len));
+            }
+            for (at, len) in got.drain(..) {
+                self.give(at, len);
+            }
+        }
+        None
+    }
+    /// Gives back `n` slots from `at` (a run [`Pools::take`] returned),
+    /// each part to the shard it lies in. How many of them were taken.
+    fn give(&self, at: usize, n: usize) -> u32 {
+        let mut left = at;
+        let end = at + n;
+        let mut given = 0;
+        while left < end {
+            let shard = (left / self.size).min(self.shards.len() - 1);
+            let shard_end = ((shard + 1) * self.size).min(end);
+            let mut pool = self.shards[shard].lock().unwrap_or_else(|e| e.into_inner());
+            given += pool.give(left - shard * self.size, shard_end - left);
+            left = shard_end;
+        }
+        given
+    }
+
+    fn taken(&self, at: usize) -> Option<bool> {
+        let shard = (at / self.size).min(self.shards.len() - 1);
+        let pool = self.shards[shard].lock().unwrap_or_else(|e| e.into_inner());
+        pool.taken.get(at - shard * self.size).copied()
+    }
+}
 pub(crate) struct HostHeap {
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
@@ -170,24 +402,12 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
-    /// How many dynamic slots are free (changed under `next`'s lock): with
-    /// fewer than a table needs, the search is not made. Once the world
-    /// had taken them all, every later table of the frame searched every
-    /// slot before it was refused.
+    /// The dynamic slots free and taken (by lists not yet reset): free runs
+    /// in shards, so a table gets the smallest run that holds it without
+    /// every recording thread queueing for one lock.
+    pool: Pools,
+    /// How many dynamic slots are free (changed under `pool`'s lock).
     free: std::sync::atomic::AtomicU32,
-    /// The shortest table that found no run of free slots since slots were
-    /// last given back (changed under `next`'s lock; `u32::MAX`: none).
-    /// Until something is given back the free runs only shrink, so a table
-    /// of that length or longer is refused without the search. Enough
-    /// slots were free, but in pieces, and every such table walked the
-    /// whole ring before it was refused: 0.33 ms each with 131,072 slots,
-    /// 1.0 s of the recording threads in a frame that refused 3,143 (run
-    /// 45), under the lock all of them need. (A free run that lies across
-    /// the place the search starts from is seen by neither.)
-    too_long: std::sync::atomic::AtomicU32,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -1442,7 +1662,7 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let taken = host.pool.taken((index - host.count) as usize);
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1575,13 +1795,17 @@ pub(crate) fn probe_view_limit() {
         if twins {
             victory_shader::emit::set_raw_views(RAW_TWINS);
         }
-        // (The twins lie past the null slot.)
+        // (The twins lie past the null slot.) Without them the heap must
+        // still hold the title's 1,245,184 views and a dynamic pool past
+        // them; a heap of only PORTABLE_VIEWS makes every table past
+        // 1,000,000 - DYNAMIC be made afresh (they come out of the title's
+        // own slots), so take the largest of these the host makes: a 10 GB
+        // NVIDIA card (RTX 3080) makes 1,835,008, not 2^21.
         let views = if twins {
             RAW_TWINS
-        } else if fits(UNCAPPED_VIEWS) {
-            UNCAPPED_VIEWS
         } else {
-            PORTABLE_VIEWS
+            const FITS: [u32; 6] = [1_835_008, 1_703_936, 1_572_864, 1_310_720, 1_048_576, PORTABLE_VIEWS];
+            FITS.into_iter().find(|&count| fits(count)).unwrap_or(PORTABLE_VIEWS)
         };
         tracing::info!(
             views,
@@ -1605,6 +1829,12 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// The fewest dynamic slots left free at a take or a refusal, and the
+/// widest run asked for, since the last line (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) static DYNAMIC_FREE_LEAST: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
@@ -1619,10 +1849,23 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(DYNAMIC << 2)
     });
-    if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+    // Room past the title's own slots; where the title reaches past the
+    // host's cap there is none. Then the pool has to come out of the
+    // title's own slots: the table pass makes every table past the fitted
+    // ones afresh in it anyway, so a bigger pool buys more than the title
+    // slots it takes (refusals of 2-slot tables at 262,144 showed the pool
+    // full, not only cut up). Keep a quarter of the host's limit for
+    // direct title slots.
+    let room = null.saturating_sub(count);
+    if room < DYNAMIC {
+        let keep = null / 4;
+        let most = most.max(DYNAMIC);
+        if null < 2 * DYNAMIC {
+            return DYNAMIC.min(null.saturating_sub(1));
+        }
+        return most.min(null.saturating_sub(keep)).max(DYNAMIC);
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    room.min(most.max(DYNAMIC))
 }
 
 impl HostHeap {
@@ -1686,8 +1929,13 @@ impl HostHeap {
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
+                tracing::warn!(
+                    count,
+                    fitted = null.saturating_sub(extra),
+                    dynamic = extra,
+                    "host view heap capped at {size}; views past it read a null slot"
+                );
+                null.saturating_sub(extra)
             };
             match make(size) {
                 Ok(heap) => (heap, fitted, size),
@@ -1750,9 +1998,9 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            pool: Pools::new(extra as usize),
             free: std::sync::atomic::AtomicU32::new(extra),
-            too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
@@ -1867,36 +2115,13 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
-        let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        // (With fewer free slots than the table needs, no run can hold it.)
+        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n;
+        let found = if enough { self.pool.take(n as usize) } else { None };
         let Some(first) = found else {
-            if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
-            }
+            #[cfg(feature = "diagnostics")]
+            DYNAMIC_FREE_LEAST
+                .fetch_min(self.free.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -1909,9 +2134,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % end) as u32;
+        self.free.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
         Some(self.count + first as u32)
     }
 
@@ -2781,13 +3004,10 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        let end = (at + n).min(self.dynamic);
+        if end > at {
+            let given = self.pool.give(at as usize, (end - at) as usize);
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
-            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -5084,6 +5304,50 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The pool gives a table the smallest free run that holds it, and a
+    /// run given back joins its neighbours: slots free in pieces still
+    /// serve the tables.
+    #[test]
+    fn the_dynamic_pool_takes_the_smallest_run_and_joins_what_is_given_back() {
+        let mut pool = Pool::new(10);
+        let a = pool.take(4).unwrap();
+        let b = pool.take(4).unwrap();
+        assert_eq!((a, b), (0, 4));
+        pool.give(0, 4);
+        // (Runs of 4 (at 0) and 2 (at 8): a table of 2 takes the smaller.)
+        assert_eq!(pool.take(2), Some(8));
+        assert_eq!(pool.take(2), Some(0));
+        // (Given back either side of a taken slot, then the slot itself.)
+        assert_eq!(pool.free(), 2);
+        pool.give(8, 2);
+        pool.give(2, 2);
+        assert_eq!(pool.at.keys().copied().collect::<Vec<_>>(), vec![2, 8]);
+        pool.give(4, 4);
+        assert_eq!(pool.at.len(), 1);
+        // (0..2 stays taken: 8 free slots from 2 on.)
+        assert_eq!(pool.free(), 8);
+        assert_eq!(pool.take(8), Some(2));
+        assert_eq!(pool.free(), 0);
+    }
+
+    /// The shards hand out runs that stay inside one shard, and a run given
+    /// back joins its neighbours there.
+    #[test]
+    fn the_dynamic_shards_keep_runs_whole_and_join_given_back_ones() {
+        let pools = Pools::new(64);
+        let a = pools.take(8).unwrap();
+        let b = pools.take(8).unwrap();
+        let c = pools.take(8).unwrap();
+        assert!(a + 8 <= b && b + 8 <= c, "{a} {b} {c}");
+        assert_eq!(pools.give(a, 8), 8);
+        assert_eq!(pools.give(a + 8 + 8, 8), 8);
+        assert_eq!(pools.give(b, 8), 8);
+        assert_eq!(pools.free(), 64);
+        // (A table bigger than a shard spans three of them.)
+        let wide = pools.take(24).unwrap();
+        assert_eq!(wide, a);
+        assert_eq!(pools.free(), 40);
+    }
 
     /// Every host sampler heap backs all 2,048 hardware descriptors and
     /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
@@ -6013,35 +6277,32 @@ mod tests {
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
+        eprintln!("free after release {}", heap.free.load(std::sync::atomic::Ordering::Relaxed));
+        for (i, sh) in heap.pool.shards.iter().enumerate() { let pl = sh.lock().unwrap_or_else(|e| e.into_inner()); eprintln!("shard {i} free {} runs {:?}", pl.free(), pl.at); }
         assert_eq!(heap.dynamic(50), Some(4));
+        eprintln!("free after 50 {}", heap.free.load(std::sync::atomic::Ordering::Relaxed));
+        for (i, sh) in heap.pool.shards.iter().enumerate() { let pl = sh.lock().unwrap_or_else(|e| e.into_inner()); eprintln!("shard {i} free {} runs {:?}", pl.free(), pl.at); }
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
 
+    /// The cursor moves on: a shard with no run that fits is passed over
+    /// for the next.
     #[test]
-    fn dynamic_search_can_find_a_run_across_the_cursor() {
-        let Some(heap) = HostHeap::new(false, 4) else {
-            eprintln!("no host descriptor heap; skipped");
-            return;
-        };
-        let first = heap.dynamic(1).unwrap();
-        let left = heap.dynamic(2).unwrap();
-        let right = heap.dynamic(2).unwrap();
-        let rest = heap.dynamic(heap.dynamic - 5).unwrap();
-        assert_eq!((first, left, right, rest), (4, 5, 7, 9));
-
-        // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
-        assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
-        assert_eq!(heap.dynamic(4), Some(left));
-        assert_eq!(heap.dynamic(1), None);
-
-        // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
-        let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
-        assert_eq!(heap.dynamic(2), None);
+    fn a_table_finds_a_run_in_a_later_shard() {
+        let pools = Pools::new(64);
+        let mut ends = Vec::new();
+        for _ in 0..8 {
+            ends.push(pools.take(7).unwrap());
+        }
+        assert_eq!(ends, [0, 8, 16, 24, 32, 40, 48, 56]);
+        assert_eq!(pools.free(), 8);
+        // One slot in every shard: no two together anywhere.
+        assert_eq!(pools.take(2), None);
+        // The cursor is past the first shard's one slot; each request goes
+        // to the next shard with room.
+        assert_eq!(pools.take(1), Some(15));
+        assert_eq!(pools.take(1), Some(23));
+        assert_eq!(pools.free(), 6);
     }
 }
 
@@ -6141,3 +6402,5 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
 }
+
+

@@ -54,6 +54,14 @@ pub(crate) enum C {
     DynamicAsked,
     DynamicRefused,
     DynamicNs,
+    /// Table bindings whose title slots lie past a host heap capped below
+    /// the title's count: each is made afresh in the dynamic pool.
+    TablesPastCap,
+    /// The fewest free dynamic slots seen at a refusal, and the tables and
+    /// slots of the ones past the cap (diagnostics).
+    DyFreeLeast,
+    DyPastCap,
+    DyPastCapSlots,
     /// Marker texts for device-removed data (`HostList::note`).
     NoteNs,
     /// Ranges given to shaders (steps), their snapshots, and the bytes
@@ -1266,7 +1274,10 @@ pub(crate) fn log(frames: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
-    let c: Vec<f64> = (0..COUNTERS).map(|i| taken(i) as f64 / frames).collect();
+    let mut c: Vec<f64> = (0..COUNTERS).map(|i| taken(i) as f64 / frames).collect();
+    c[C::DyFreeLeast as usize] = f64::from(
+        crate::descriptor::host::DYNAMIC_FREE_LEAST.swap(u32::MAX, Relaxed),
+    );
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
@@ -1303,7 +1314,8 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
-         refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
+         refused, {:.1} ms searching (the fewest free {:.0}, {:.0} tables past the cap in \
+         {:.0} slots); notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
@@ -1314,6 +1326,9 @@ pub(crate) fn log(frames: f64) {
         c[C::DynamicAsked as usize],
         c[C::DynamicRefused as usize],
         c[C::DynamicNs as usize] / 1e6,
+        c[C::DyFreeLeast as usize],
+        c[C::DyPastCap as usize],
+        c[C::DyPastCapSlots as usize],
         c[C::NoteNs as usize] / 1e6,
         c[C::GpuWrites as usize],
         c[C::BackSubmissions as usize],
