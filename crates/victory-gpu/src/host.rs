@@ -42,6 +42,8 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// Atomic mirror of the highest value signalled on `fence`.
+    last_signalled: std::sync::atomic::AtomicU64,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -167,18 +169,21 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
-    const IDLE_MS: u64 = 5_000;
-    const SHORT_MS: u64 = 1_500;
+    const WARM_MS: u64 = 30_000;
+    const IDLE_MS: u64 = 3_000;
+    const SHORT_MS: u64 = 1_000;
     if budget == 0 {
-        return (IDLE_MS, u64::MAX);
+        return (5_000, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    if used < share(78) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(85) {
+        (WARM_MS, used.saturating_sub(share(75)))
+    } else if used < share(90) {
+        (IDLE_MS, used.saturating_sub(share(82)))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used.saturating_sub(share(82)))
     }
 }
 
@@ -570,6 +575,12 @@ fn sweep() {
 /// before it have finished too.
 pub(crate) fn submissions() -> (u64, u64) {
     (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
+}
+
+/// Number of submissions currently started and not yet finished.
+pub(crate) fn submissions_in_flight() -> u64 {
+    let (started, finished) = submissions();
+    started.saturating_sub(finished)
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -1096,6 +1107,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            last_signalled: std::sync::atomic::AtomicU64::new(0),
             event,
             rtvs,
             rtv_size,
@@ -5241,6 +5253,7 @@ impl Host {
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
+                    self.last_signalled.store(*submitted, Ordering::Release);
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -5697,10 +5710,10 @@ impl Host {
         // Renderer port #7 (from renderer patch #4): the round asked for when
         // the title submitted it, if that is known (`crate::port_journal`).
         let heaps_on = crate::port_journal::on();
-        let heaps_synced = match crate::port_journal::needed() {
+        let mut heaps_synced = Some(match crate::port_journal::needed() {
             0 => crate::descriptor::begin_sync_heaps(),
             mark => crate::descriptor::begin_sync_heaps_after(mark),
-        };
+        });
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -5734,7 +5747,16 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        if late && flying() && crate::resource::has_unclamped_rebinds() {
+            self.settle(&mut submitted, WHY_SYNC);
+        }
         let behind = late && flying();
+        if !behind && crate::resource::needs_submit_maintenance() {
+            // Join any background `victory-heap-sync` pass before mutating
+            // `HostHeap` slots in `evict_if_pressured()`.
+            heaps_synced.take();
+            crate::resource::evict_if_pressured();
+        }
         stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
@@ -5910,7 +5932,12 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         if late {
-            *submitted += 1;
+            let frame = crate::frame::current();
+            let next_fence = *submitted + 1;
+            for list in runs {
+                list.stamp_textures(frame, next_fence);
+            }
+            *submitted = next_fence;
             #[cfg(feature = "diagnostics")]
             if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
@@ -5927,6 +5954,7 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            self.last_signalled.store(*submitted, Ordering::Release);
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -5976,8 +6004,13 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [(&lists[..], ())];
         submitting(2, runs.len());
+        let frame = crate::frame::current();
         for (_i, &(group, _kind)) in groups.iter().enumerate() {
-            *submitted += 1;
+            let next_fence = *submitted + 1;
+            for list in runs {
+                list.stamp_textures(frame, next_fence);
+            }
+            *submitted = next_fence;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -5986,6 +6019,7 @@ impl Host {
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
+                    .map(|()| self.last_signalled.store(*submitted, Ordering::Release))
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
@@ -6611,6 +6645,14 @@ impl HostList {
                 }
                 (before != wanted).then_some((texture, before))
             }
+        }
+    }
+
+    /// Stamps `frame` and `fence` onto every host texture this list holds.
+    pub(crate) fn stamp_textures(&self, frame: u64, fence: u64) {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, _, copy) in states.values() {
+            copy.note_submitted(frame, fence);
         }
     }
 
@@ -8957,6 +8999,45 @@ impl Host {
         &self.queue
     }
 
+    pub(crate) fn completed_fence(&self) -> u64 {
+        // SAFETY: a plain fence query.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
+    pub(crate) fn last_signalled_fence(&self) -> u64 {
+        self.last_signalled.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fence(&self) -> &ID3D12Fence {
+        &self.fence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_submit_lock_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_fenced_for_test(&self, list: &HostList, release_states: bool) -> u64 {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let next = *submitted + 1;
+        list.stamp_textures(crate::frame::current(), next);
+        if release_states {
+            list.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        *submitted = next;
+        let cmd: Option<ID3D12CommandList> = list.list.cast().ok();
+        // SAFETY: closed list and our fence, under `submitted`.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[cmd]);
+            self.queue.Signal(&self.fence, next).expect("signal host fence");
+        }
+        self.last_signalled.store(next, Ordering::Release);
+        next
+    }
+
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
@@ -11289,11 +11370,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn textures_are_kept_while_the_card_has_room() {
         use super::vram_keep;
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
-        // Past it: the longest idle ones, enough to come down to 85 %.
-        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
-        assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
+        assert_eq!(vram_keep(100 * gib, 77 * gib).0, 600_000);
+        assert_eq!(vram_keep(100 * gib, 82 * gib), (30_000, 7 * gib));
+        // Pressured & over-budget: longest idle first, down to 82 %.
+        assert_eq!(vram_keep(100 * gib, 88 * gib), (3_000, 6 * gib));
+        assert_eq!(vram_keep(100 * gib, 95 * gib), (1_000, 13 * gib));
+        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_000, 38 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
     }
 

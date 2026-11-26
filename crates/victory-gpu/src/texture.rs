@@ -50,6 +50,9 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice, of the title's texture.
     mips: u32,
+    /// Host texture dimensions (`d.Width`, `d.Height`) this staging was built for.
+    host_width: u64,
+    host_height: u32,
     /// The first of them that is read and uploaded
     /// (`crate::resource::held_only`), the one the host copy begins at, and
     /// the bytes of title memory read.
@@ -1552,10 +1555,14 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
+    let _ = take_staged(resource);
+}
+
+/// Removes and returns a title texture's staging buffer so the caller can
+/// drop it outside locks.
+pub(crate) fn take_staged(resource: This) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
-    }
+    map.as_mut()?.remove(&(resource as usize))
 }
 
 /// Where a staged title texture's memory is: address and bytes.
@@ -1839,19 +1846,32 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
-/// The staging state of a title texture, made on first use.
+/// The staging state of a title texture, made on first use or rebuilt if the
+/// resident host texture changed serial/dimensions/mip count (e.g. `ensure_unclamped`).
 fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize))
-        && s.first <= first.max(copy.base)
-        && s.serial == copy.serial
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let level0 = copy.base;
+    let host_mips = u32::from(d.MipLevels);
+    let mips = level0 + host_mips;
     {
-        return Some(s.clone());
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(HashMap::new);
+        if let Some(s) = map.get(&(resource as usize))
+            && s.first <= first.max(level0)
+            && s.serial == copy.serial
+            && s.on_demand == on_demand
+            && s.level0 == level0
+            && s.mips == mips
+            && s.host_width == d.Width
+            && s.host_height == d.Height
+        {
+            return Some(s.clone());
+        }
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
@@ -1867,10 +1887,6 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         return None;
     }
     let host = host()?;
-    // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
-    let level0 = copy.base;
-    let mips = level0 + u32::from(d.MipLevels);
     let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
     let read = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -1930,6 +1946,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         rows,
         layout,
         mips,
+        host_width: d.Width,
+        host_height: d.Height,
         first,
         level0,
         read,
@@ -1949,8 +1967,37 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
     });
-    map.insert(resource as usize, s.clone());
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    // Never overwrite an already-upgraded higher-serial or wider-mip `Staging`
+    // with a racing stale entry; still return `s` for the caller's own `copy`.
+    if map.get(&(resource as usize)).is_none_or(|old| {
+        old.serial < copy.serial
+            || (old.serial == copy.serial
+                && old.on_demand == on_demand
+                && old.mips <= mips
+                && old.first >= first)
+    }) {
+        map.insert(resource as usize, s.clone());
+    }
     Some(s)
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn staging_shape_for_test(
+    resource: This,
+    copy: &crate::resource::HostTexture,
+) -> Option<(u32, u32, u32, u32)> {
+    let s = staging(resource, copy, 0)?;
+    let f0 = s.footprints.first()?.Footprint;
+    Some((s.mips - s.level0, s.level0, f0.Width, f0.Height))
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn cached_staging_mips_for_test(resource: This) -> Option<u32> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let s = map.as_ref()?.get(&(resource as usize))?;
+    Some(s.mips - s.level0)
 }
 
 #[cfg(test)]
@@ -2302,5 +2349,49 @@ mod allocation_costs {
             timed("texture placed in 64 MB heaps", N, 1, &place);
             timed("texture placed in 64 MB heaps", N, 8, &place);
         }
+    }
+
+    #[test]
+    fn bc7_tail_mip_staging_hits_cache_without_rebuilding() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        if crate::host::host().is_none() {
+            return;
+        }
+        // 1. 64x64 BC7 (`format = 98`, 7 mips -> mip 5 is 2x2, rounded to 4x4 block footprint).
+        let desc64 = [3u32, 0, 0, 0, 64, 0, 64, 0x7_0001, 98, 1, 0, 0x105, 0, 0];
+        let bytes64 = crate::resource::placed_bytes(&desc64).unwrap();
+        // SAFETY: dedicated committed memory for test texture.
+        let at64 = unsafe {
+            VirtualAlloc(std::ptr::null(), bytes64 as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        let tex64 = crate::resource::texture_at(at64 as u64, &desc64).unwrap();
+        let copy64 = crate::resource::host_copy(tex64).unwrap();
+        let s1 = super::staging(tex64, &copy64, 5).expect("64x64 BC7 tail staging");
+        let s2 = super::staging(tex64, &copy64, 5).expect("64x64 BC7 tail cache hit");
+        assert!(
+            std::sync::Arc::ptr_eq(&s1, &s2),
+            "BC7 tail mip staging must hit STAGING cache instead of rebuilding"
+        );
+
+        // 2. 100x100 BC7 (`format = 98`, 7 mips -> mip 1 is 50x50, GetCopyableFootprints rounds to 52x52).
+        let desc100 = [3u32, 0, 0, 0, 100, 0, 100, 0x7_0001, 98, 1, 0, 0x105, 0, 0];
+        let bytes100 = crate::resource::placed_bytes(&desc100).unwrap();
+        // SAFETY: dedicated committed memory for test texture.
+        let at100 = unsafe {
+            VirtualAlloc(std::ptr::null(), bytes100 as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        let tex100 = crate::resource::texture_at(at100 as u64, &desc100).unwrap();
+        let copy100 = crate::resource::host_copy(tex100).unwrap();
+        let n1 = super::staging(tex100, &copy100, 1).expect("100x100 BC7 mip1 staging");
+        let n2 = super::staging(tex100, &copy100, 1).expect("100x100 BC7 mip1 cache hit");
+        assert_eq!(n1.first, 1);
+        assert_eq!(n1.footprints[0].Footprint.Width, 52);
+        assert_eq!(n1.footprints[0].Footprint.Height, 52);
+        assert!(
+            std::sync::Arc::ptr_eq(&n1, &n2),
+            "NPOT BC7 mip staging with block-aligned footprint must hit STAGING cache"
+        );
     }
 }
