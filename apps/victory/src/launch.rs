@@ -111,9 +111,9 @@ impl Screen {
     }
 
     fn lines(&self) -> Vec<(String, u32)> {
-        const PLAIN: u32 = 0x00dcdcdc;
-        const DIM: u32 = 0x00a0a0a0;
-        const BAD: u32 = 0x006060ff;
+        const PLAIN: u32 = 0x00ffffff;
+        const DIM: u32 = 0x00e8c8f0;
+        const BAD: u32 = 0x008080ff;
         let mut out = Vec::new();
         let done = self.made + self.failed;
         match self.stage {
@@ -441,6 +441,21 @@ fn keep_place(title: HWND) {
     }
 }
 
+/// `0x00bbggrr` between `a` and `b` at `t` (0..=1).
+fn mix(a: u32, b: u32, t: f64) -> u32 {
+    let ch = |c: u32, shift: u32| ((c >> shift) & 0xff) as f64;
+    let at = |shift: u32| ((ch(a, shift) + (ch(b, shift) - ch(a, shift)) * t.clamp(0.0, 1.0)).round() as u32) << shift;
+    at(0) | at(8) | at(16)
+}
+
+/// The sky from top to bottom: night violet, magenta, sunset orange
+/// (`0x00bbggrr`).
+const SKY: [u32; 3] = [0x003a0f24, 0x007a1fc2, 0x00407cff];
+
+fn sky(t: f64) -> u32 {
+    if t < 0.6 { mix(SKY[0], SKY[1], t / 0.6) } else { mix(SKY[1], SKY[2], (t - 0.6) / 0.4) }
+}
+
 fn paint(hwnd: HWND) {
     let (lines, fraction) = match lock(&SCREEN).as_ref() {
         Some(s) => (s.lines(), s.fraction()),
@@ -462,29 +477,65 @@ fn paint(hwnd: HWND) {
             gdi::FillRect(dc, &r, brush);
             gdi::DeleteObject(brush);
         };
-        fill(client, 0x00181818);
-        let font = |height: i32, weight: i32| {
-            gdi::CreateFontW(height, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"))
+        // The sky, in bands.
+        let band = 3;
+        for y in (0..h).step_by(band as usize) {
+            fill(RECT { left: 0, top: y, right: w, bottom: y + band }, sky(f64::from(y) / f64::from(h)));
+        }
+        // A low sun, cut by the lines of the horizon.
+        let radius = h / 4;
+        let (cx, cy) = (w * 7 / 10, h * 7 / 10);
+        for y in (cy - radius)..cy.min(h) {
+            let dy = f64::from(cy - y);
+            let half = (f64::from(radius).powi(2) - dy * dy).max(0.0).sqrt() as i32;
+            let below = f64::from(y - (cy - radius)) / f64::from(radius);
+            // Gaps that widen towards the horizon.
+            let gap = (below * 8.0) as i32;
+            if gap > 0 && (y - (cy - radius)).rem_euclid(14) < gap.min(10) {
+                continue;
+            }
+            fill(RECT { left: cx - half, top: y, right: cx + half, bottom: y + 1 }, mix(0x0060e6ff, 0x008a3dff, below));
+        }
+        // Ground: dark water below the horizon.
+        fill(RECT { left: 0, top: cy, right: w, bottom: h }, 0x00301020);
+        for k in 0..6 {
+            let y = cy + (h - cy) * k * k / 36;
+            fill(RECT { left: 0, top: y, right: w, bottom: y + 1 }, 0x00803a90);
+        }
+        let font = |height: i32, weight: i32, italic: u32, face: PCWSTR| {
+            gdi::CreateFontW(height, 0, 0, 0, weight, italic, 0, 0, 1, 0, 0, 5, 0, face)
         };
-        let (big, small) = (font(-(h / 14).clamp(24, 64), 600), font(-(h / 40).clamp(14, 28), 400));
+        let title_h = (h / 7).clamp(32, 120);
+        let small_h = (h / 42).clamp(14, 26);
+        let big = font(-title_h, 800, 1, w!("Bahnschrift SemiBold Condensed"));
+        let small = font(-small_h, 600, 0, w!("Bahnschrift"));
         gdi::SetBkMode(dc, gdi::TRANSPARENT as _);
         let margin = w / 12;
         let text = |s: &str, top: i32, height: i32, colour: u32, f| {
             let old = gdi::SelectObject(dc, f);
+            let mut t = wide(s);
+            let flags = gdi::DT_LEFT | gdi::DT_SINGLELINE | gdi::DT_END_ELLIPSIS | gdi::DT_NOPREFIX;
+            // A soft shadow, then the text.
+            gdi::SetTextColor(dc, 0x00200818);
+            let mut r = RECT { left: margin + 2, top: top + 2, right: w - margin + 2, bottom: top + height + 2 };
+            gdi::DrawTextW(dc, t.as_mut_ptr(), -1, &mut r, flags);
             gdi::SetTextColor(dc, colour);
             let mut r = RECT { left: margin, top, right: w - margin, bottom: top + height };
-            let mut t = wide(s);
-            gdi::DrawTextW(dc, t.as_mut_ptr(), -1, &mut r, gdi::DT_LEFT | gdi::DT_SINGLELINE | gdi::DT_END_ELLIPSIS | gdi::DT_NOPREFIX);
+            gdi::DrawTextW(dc, t.as_mut_ptr(), -1, &mut r, flags);
             gdi::SelectObject(dc, old);
         };
-        let line = (h / 40).clamp(14, 28) * 3 / 2;
-        let mut y = h / 5;
-        text("Victory Native", y, (h / 14).clamp(24, 64) * 2, 0x00ffffff, big);
-        y += (h / 14).clamp(24, 64) * 2;
-        let bar = RECT { left: margin, top: y, right: w - margin, bottom: y + line / 2 };
-        fill(bar, 0x00383838);
-        let filled = bar.left + ((bar.right - bar.left) as f64 * fraction.clamp(0.0, 1.0)) as i32;
-        fill(RECT { right: filled, ..bar }, 0x00d08a3a);
+        let line = small_h * 3 / 2;
+        let mut y = h / 8;
+        text("VICTORY NATIVE", y, title_h * 5 / 4, 0x00ffffff, big);
+        y += title_h * 5 / 4 + line / 2;
+        // The bar: a dark track, then pink to orange as far as it has come.
+        let bar = RECT { left: margin, top: y, right: w - margin, bottom: y + (line / 2).max(8) };
+        fill(bar, 0x00301028);
+        let filled = bar.left + (f64::from(bar.right - bar.left) * fraction.clamp(0.0, 1.0)) as i32;
+        for x in (bar.left..filled).step_by(2) {
+            let t = f64::from(x - bar.left) / f64::from((bar.right - bar.left).max(1));
+            fill(RECT { left: x, top: bar.top, right: x + 2, bottom: bar.bottom }, mix(0x00b040ff, 0x0040a8ff, t));
+        }
         y += line;
         for (s, colour) in &lines {
             text(s, y, line, *colour, small);
@@ -538,6 +589,15 @@ mod tests {
         let mut s = Screen::new();
         s.hear("plan 0 50 50 0");
         assert_eq!(s.fraction(), 1.0);
+    }
+
+    #[test]
+    fn colours_mix_by_channel() {
+        assert_eq!(mix(0x00000000, 0x00ffffff, 0.0), 0);
+        assert_eq!(mix(0x00000000, 0x00ffffff, 1.0), 0x00ffffff);
+        assert_eq!(mix(0x00000010, 0x00000030, 0.5), 0x00000020);
+        assert_eq!(sky(0.0), SKY[0]);
+        assert_eq!(sky(1.0), SKY[2]);
     }
 
     #[test]
