@@ -1054,6 +1054,16 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // RDNA4's compiler (amdxc64.dll 32.0.32029.2010, RX 9070 XT) faults reading
+        // address 8 on at least one of the title's compute programs (052a2316a03b9ba1,
+        // bound during Game Init) when dead code, constants and reuse have all run over
+        // it; any two of the three, or the other passes, it compiles. Without
+        // `VICTORY_SHADER_OPT` such a host leaves reuse out.
+        if let Some(id) = rdna4(&device) {
+            let passes = victory_shader::emit::passes::DEFAULT & !RDNA4_LEFT_OUT;
+            victory_shader::emit::set_host_shader_opt(passes);
+            tracing::info!(device = format_args!("{id:#06x}"), passes, "RDNA4 host: shader clean-up without the pass its compiler faults on");
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -1141,6 +1151,26 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
         }
         Ok(adapter)
     }
+}
+
+/// The clean-up pass an RDNA4 host leaves out ([`rdna4`]).
+const RDNA4_LEFT_OUT: u32 = victory_shader::emit::passes::REUSE;
+
+/// The PCI device id of `device`'s adapter when it is an AMD RDNA4 card
+/// (Navi 48: RX 9070 / 9070 XT / 9070 GRE, Radeon AI PRO R9700; Navi 44:
+/// RX 9060 / 9060 XT).
+fn rdna4(device: &ID3D12Device) -> Option<u32> {
+    const NAVI48: [u32; 2] = [0x7550, 0x7551];
+    const NAVI44: [u32; 1] = [0x7590];
+    // SAFETY: plain queries.
+    let desc = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .ok()?
+    };
+    (desc.VendorId == 0x1002 && (NAVI48.contains(&desc.DeviceId) || NAVI44.contains(&desc.DeviceId)))
+        .then_some(desc.DeviceId)
 }
 
 #[cfg(test)]

@@ -119,6 +119,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+/// The clean-up passes' bits ([`shader_opt`]).
+pub use bitcode::opt as passes;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -216,11 +218,24 @@ pub fn builder_bounds() -> bool {
 ///   64 the dwords of one console load read by one call for every four
 ///   (not on unless asked: `127` is every pass with it).
 ///
+/// Unset, it is the host's default ([`set_host_shader_opt`]): 63, or fewer
+/// passes on a host whose driver is known to fault on what all of them make.
+///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
-    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+    static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    ASKED
+        .get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+        .unwrap_or_else(|| HOST_OPT.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+static HOST_OPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(bitcode::opt::DEFAULT);
+
+/// The clean-up passes [`shader_opt`] gives when `VICTORY_SHADER_OPT` is
+/// unset: set by the host before its first translation.
+pub fn set_host_shader_opt(passes: u32) {
+    HOST_OPT.store(passes & bitcode::opt::ALL, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -303,16 +318,16 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out
 }
 
-/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
+/// `VICTORY_SHADER_OPT`'s value; none (the host's default) when it is unset or
 /// unreadable. Pure, for testing.
-fn parse_shader_opt(value: Option<&str>) -> u32 {
-    let parsed = value
+fn parse_shader_opt(value: Option<&str>) -> Option<u32> {
+    value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
-        });
-    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+        })
+        .map(|n| n & bitcode::opt::ALL)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -1115,13 +1130,13 @@ mod tests {
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
         assert_eq!(usual, 63, "the passes of the builds before the wide loads");
-        assert_eq!(parse_shader_opt(None), usual);
-        assert_eq!(parse_shader_opt(Some("0")), 0);
-        assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
-        assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
-        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
-        assert_eq!(parse_shader_opt(Some("on")), usual);
+        assert_eq!(parse_shader_opt(None), None, "unset: the host's default");
+        assert_eq!(parse_shader_opt(Some("0")), Some(0));
+        assert_eq!(parse_shader_opt(Some(" 1 ")), Some(1));
+        assert_eq!(parse_shader_opt(Some("0x1")), Some(1));
+        assert_eq!(parse_shader_opt(Some("127")), Some(all));
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), Some(all));
+        assert_eq!(parse_shader_opt(Some("on")), None, "unreadable: the host's default");
     }
 
     #[test]
