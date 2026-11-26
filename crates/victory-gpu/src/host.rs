@@ -10478,27 +10478,126 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             ..Default::default()
         };
         RegisterClassExW(&class);
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: width as i32,
-            bottom: height as i32,
-        };
-        AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        let display = borderless().then(primary_display).flatten();
+        let place = window_place(width, height, display)?;
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            place.style | WS_VISIBLE,
+            place.x,
+            place.y,
+            place.width,
+            place.height,
             None,
             None,
             Some(instance.into()),
             None,
         )
+    }
+}
+
+/// `VICTORY_BORDERLESS=1`: the window covers the primary display with no border or title bar
+/// (windowed borderless, not exclusive full screen: the swap chain stretches the picture to it,
+/// the title's render size is unchanged, alt-tab and other windows work as before).
+fn borderless() -> bool {
+    std::env::var("VICTORY_BORDERLESS").is_ok_and(|v| v.trim() == "1")
+}
+
+/// The primary display's rectangle on the desktop; `None` when it cannot be asked.
+fn primary_display() -> Option<RECT> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+    };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the primary display's handle, and a MONITORINFO of the size it declares.
+    let asked = unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        GetMonitorInfoW(monitor, &mut info).as_bool()
+    };
+    asked.then_some(info.rcMonitor)
+}
+
+/// Where the window goes and how it looks.
+#[derive(Debug, PartialEq, Eq)]
+struct WindowPlace {
+    style: WINDOW_STYLE,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+/// A bordered window whose client area is `width` x `height` where the system puts it, or with a
+/// display given, a borderless window that covers exactly that display.
+fn window_place(
+    width: u32,
+    height: u32,
+    display: Option<RECT>,
+) -> windows::core::Result<WindowPlace> {
+    if let Some(d) = display {
+        return Ok(WindowPlace {
+            style: WS_POPUP,
+            x: d.left,
+            y: d.top,
+            width: d.right - d.left,
+            height: d.bottom - d.top,
+        });
+    }
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: width as i32,
+        bottom: height as i32,
+    };
+    // SAFETY: adjusts a rectangle we own.
+    unsafe { AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)? };
+    Ok(WindowPlace {
+        style: WS_OVERLAPPEDWINDOW,
+        x: CW_USEDEFAULT,
+        y: CW_USEDEFAULT,
+        width: rect.right - rect.left,
+        height: rect.bottom - rect.top,
+    })
+}
+
+#[cfg(test)]
+mod window_place_tests {
+    use super::*;
+
+    #[test]
+    fn a_display_given_makes_a_borderless_window_that_covers_it() {
+        // A secondary display left of the primary one: negative desktop coordinates.
+        let display = RECT {
+            left: -2560,
+            top: 0,
+            right: 0,
+            bottom: 1440,
+        };
+        let place = window_place(3840, 2160, Some(display)).unwrap();
+        assert_eq!(
+            place,
+            WindowPlace {
+                style: WS_POPUP,
+                x: -2560,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            }
+        );
+    }
+
+    #[test]
+    fn without_a_display_the_window_is_bordered_around_the_client_size() {
+        let place = window_place(1920, 1080, None).unwrap();
+        assert_eq!(place.style, WS_OVERLAPPEDWINDOW);
+        assert_eq!((place.x, place.y), (CW_USEDEFAULT, CW_USEDEFAULT));
+        // The border and title bar are added around the client area.
+        assert!(place.width > 1920 && place.height > 1080);
     }
 }
 
