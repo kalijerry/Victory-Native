@@ -160,14 +160,16 @@ pub(crate) fn translation() -> [u8; 32] {
 /// can do decides the form of some programs.
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
-    let misses = MISSES.load(Ordering::Relaxed);
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate, true)?,
-        None => translate(container)?,
+    // Told by this call's own converter, not by the process-wide `MISSES`
+    // around it: with several workers another one's miss fell between two
+    // reads of it and a hit was counted as translated now (issue #32).
+    let ran = match CACHE.get() {
+        Some(cache) => cached_ran(cache, &build(), SOURCE, container, translate, true)?.1,
+        // No cache: translated now, and not kept.
+        None => translate(container).map(|_| true)?,
     };
-    // (Counts other threads' misses too: the caller only adds them up.)
-    Ok(MISSES.load(Ordering::Relaxed) == misses)
+    Ok(!ran)
 }
 
 /// The translation of a console shader container, from the cache when
@@ -225,6 +227,20 @@ fn cached_by(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
     refresh: bool,
 ) -> Result<HostShader, String> {
+    cached_ran(cache, build, source, container, translate, refresh).map(|(shader, _)| shader)
+}
+
+/// [`cached_by`], and whether this call translated it (a miss) rather than
+/// serving it from the cache (a hit), as it counted it in [`MISSES`] or
+/// [`HITS`].
+fn cached_ran(
+    cache: &Cache,
+    build: &[u8; 32],
+    source: &str,
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+    refresh: bool,
+) -> Result<(HostShader, bool), String> {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -266,13 +282,13 @@ fn cached_by(
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            return Ok((shader, ran));
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    (converter.translate)(container).map(|shader| (shader, true))
 }
 
 const MAGIC: &[u8; 4] = b"VSH2";
@@ -487,6 +503,42 @@ mod tests {
                 shift: 5,
             }],
         }
+    }
+
+    /// Whether a call translated is its own: another worker's miss at the
+    /// same moment does not make a hit read as translated now (issue #32).
+    #[test]
+    fn a_call_tells_its_own_hit_or_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [9u8; 32];
+        let translate = |_: &[u8]| Ok(shader());
+        let ran = |container: &[u8], build: &[u8; 32]| cached_ran(&cache, build, SOURCE, container, translate, false).map(|(_, ran)| ran);
+        assert_eq!(ran(b"one", &build), Ok(true), "first: translated");
+        assert_eq!(ran(b"one", &build), Ok(false), "then: from the cache");
+        assert_eq!(ran(b"one", &[10; 32]), Ok(true), "another build: translated");
+        for e in walk(dir.path()) {
+            std::fs::write(e, b"VSH2 broken").unwrap();
+        }
+        assert_eq!(ran(b"one", &build), Ok(true), "a damaged entry: translated");
+        assert_eq!(ran(b"one", &build), Ok(false));
+
+        // Hits while other threads miss all the time.
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let missing = s.spawn(|| {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    assert_eq!(ran(format!("other {n}").as_bytes(), &build), Ok(true));
+                }
+            });
+            for _ in 0..200 {
+                assert_eq!(ran(b"one", &build), Ok(false), "a hit beside other misses");
+            }
+            stop.store(true, Ordering::Relaxed);
+            missing.join().unwrap();
+        });
     }
 
     #[test]
