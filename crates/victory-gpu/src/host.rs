@@ -9651,6 +9651,11 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
+            // Frame generation presents through its proxy from the one list
+            // upstream runs it with, not one sent ahead: in a sent-ahead
+            // list it crashed a run freeing objects (`bury`) after 4 minutes.
+            #[cfg(feature = "diagnostics")]
+            let read_now = read_now || p.framegen.is_some();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
