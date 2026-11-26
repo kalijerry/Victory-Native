@@ -96,10 +96,6 @@ impl TableGroup {
         Some(&self.entries[self.by_descriptor[i].1])
     }
 
-    fn needs_snapshot(&self, heap: &crate::descriptor::Heap, host_count: u32, table: u64) -> bool {
-        self.past_cap(heap, host_count, table).is_some()
-    }
-
     /// The table's descriptors that lie past a host heap capped below the
     /// title's count: those have no title slot of their own and are made
     /// afresh in the dynamic pool, which on such a heap comes out of the
