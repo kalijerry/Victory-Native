@@ -4833,12 +4833,26 @@ mod tests {
         }
         assert!(writes(one, one + BLOCK, true).is_some() && writes(two, two + BLOCK, true).is_some());
         put_count(one / BLOCK).store(0, std::sync::atomic::Ordering::Relaxed);
-        let put = |byte: u8| loop {
-            // SAFETY: a byte of the section's only page.
-            let done = put_beside(one / BLOCK, 1, |delta| unsafe { ((one + 100).wrapping_add(delta) as *mut u8).write(byte) });
-            // (Other tests hold changes of mapping.)
-            if done != Beside::Cannot {
-                return done;
+        let put = |byte: u8| {
+            // (Other tests hold changes of mapping, for a moment. A state that
+            // does not pass – another test that panicked midway, the block no
+            // longer guarded – fails the test here instead of hanging the
+            // whole suite until the job's timeout.)
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                // SAFETY: a byte of the section's only page.
+                let done = put_beside(one / BLOCK, 1, |delta| unsafe { ((one + 100).wrapping_add(delta) as *mut u8).write(byte) });
+                if done != Beside::Cannot {
+                    return done;
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "put_beside answered Cannot for 30 s: guarded {}, light {}, view guard {}",
+                    PROTECTED.any(one / BLOCK, one / BLOCK + 1),
+                    light(),
+                    view_guard()
+                );
+                std::thread::yield_now();
             }
         };
         for round in 1..4 {
