@@ -102,6 +102,16 @@ pub(crate) fn on() -> bool {
     set() != Set::Off && !crate::pipeline::builder_runs()
 }
 
+/// Inputs for the lighting pass of this role. Constant light resolves
+/// from depth and never reads the radiance estimate's private buffers.
+fn parameters(preset: Set, role: Role) -> Option<(f32, f32)> {
+    match (preset, role) {
+        (Set::Estimate(level), _) => Some((level, 0.0)),
+        (Set::Constant(level), Role::Resolve) => Some((0.0, level)),
+        _ => None,
+    }
+}
+
 /// The most the air scatters, as a multiple of the light around
 /// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
 fn air() -> f32 {
@@ -530,24 +540,27 @@ pub(crate) struct Views {
 }
 
 /// After the title's program of that role, in `list` with the program's view
-/// heap set. Replaces the list's compute root signature and pipeline; false
-/// if it recorded nothing.
+/// heap set. Returns true if it replaces the list's compute root signature
+/// and pipeline.
 pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     use std::sync::atomic::Ordering;
-    let Some(pass) = pass() else {
+    let preset = set();
+    let Some((level, constant)) = parameters(preset, role) else {
+        if matches!(preset, Set::Constant(_)) && role == Role::Radiance {
+            // Preserve the ordering after the title's radiance dispatch.
+            uav_barrier(&list.list);
+        }
         return false;
-    };
-    let (level, constant) = match set() {
-        Set::Off => return false,
-        Set::Estimate(level) => (level, 0.0f32),
-        Set::Constant(level) => (0.0, level),
     };
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::Air && air() == 0.0 {
         return false;
     }
+    let Some(pass) = pass() else {
+        return false;
+    };
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -631,6 +644,19 @@ mod tests {
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    #[test]
+    fn constant_light_only_runs_its_resolve() {
+        let constant = Set::Constant(0.8);
+        assert_eq!(parameters(constant, Role::Resolve), Some((0.0, 0.8)));
+        assert_eq!(parameters(constant, Role::Radiance), None);
+        assert_eq!(parameters(constant, Role::Air), None);
+        let estimate = Set::Estimate(0.8);
+        assert_eq!(parameters(estimate, Role::Radiance), Some((0.8, 0.0)));
+        assert_eq!(parameters(estimate, Role::Resolve), Some((0.8, 0.0)));
+        assert_eq!(parameters(estimate, Role::Air), Some((0.8, 0.0)));
+        assert_eq!(parameters(Set::Off, Role::Resolve), None);
     }
 
     /// The passes compile with the system's compiler and the host takes them.
