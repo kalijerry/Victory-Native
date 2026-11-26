@@ -811,6 +811,60 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     0
 }
 
+/// The title's upscale (its `ffxDispatch`, Series S) as a plain stretch of
+/// the colour input over the output (`crate::stretch`), in place of the
+/// title's own FidelityFX passes; false if it could not be recorded. From
+/// CuteBooty/victory-8gb.
+#[cfg(windows)]
+pub fn upscale_stretch(
+    this: *const std::ffi::c_void,
+    colour: *const std::ffi::c_void,
+    output: *const std::ffi::c_void,
+    render: [u32; 2],
+) -> bool {
+    const SHADER_READ: u32 = 0x40;
+    const UNORDERED: u32 = 0x8;
+    let (this, colour, output): (This, This, This) = (this.cast(), colour.cast(), output.cast());
+    if this.is_null() || colour.is_null() || output.is_null() {
+        return false;
+    }
+    let mut done = false;
+    with_state(this, |list, state| {
+        let (Some(to), Some(from), Some(host)) = (
+            crate::resource::host_resource(output),
+            crate::resource::host_resource(colour),
+            crate::host::host(),
+        ) else {
+            return;
+        };
+        ensure_state(list, colour, SHADER_READ);
+        ensure_state(list, output, UNORDERED);
+        done = crate::stretch::record_stretch(&host.device, &list.list, to, from, render);
+        if done {
+            crate::texture::host_written(output);
+        }
+        state.replay(list);
+    });
+    done
+}
+
+/// For the upscale probe (`VICTORY_UPSCALE_PROBE=1`): each title texture's
+/// host copy as `WxH fmt N` (DXGI format number), or `none`.
+#[cfg(windows)]
+pub fn upscale_inputs(textures: &[*const std::ffi::c_void]) -> Vec<String> {
+    textures
+        .iter()
+        .map(|&t| match crate::resource::host_resource(t.cast()) {
+            Some(r) => {
+                // SAFETY: a live host resource.
+                let d = unsafe { r.GetDesc() };
+                format!("{}x{} fmt {}", d.Width, d.Height, d.Format.0)
+            }
+            None => "none".to_owned(),
+        })
+        .collect()
+}
+
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {

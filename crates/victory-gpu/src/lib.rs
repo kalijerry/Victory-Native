@@ -75,6 +75,8 @@ mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod stretch;
+#[cfg(windows)]
 mod safecopy;
 #[cfg(windows)]
 mod sampler;
