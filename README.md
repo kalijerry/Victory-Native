@@ -1,12 +1,38 @@
-# VIctory on an RX 7900 XTX
+# Victory AMD
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+A fork of [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (at its
+commit 2de9980), itself a fork of [VIctory](https://github.com/Marvisak/VIctory): a
+compatibility layer that runs an Xbox Series title natively on Windows from files the
+user supplies. Everything below this section up to "The goal" is unchanged from
+upstream; the history, authors and credits of both projects are kept.
+
+## Why this fork, and its rules
+
+Victory AMD follows the same goal (below) with a stricter direction:
+
+- **The title's own picture, nothing added, nothing hidden.** No stand-in light, no
+  clamping, blur or masking to make a frame look better. A defect is fixed at its
+  cause, or it stays visible and listed in [docs/workarounds.md](docs/workarounds.md).
+- **No picture traded for frame rate in silence.** A change that alters the picture is
+  opt-in until it is measured identical.
+- **Every temporary workaround is a named switch,** logged when it acts and listed with
+  its cause and the way out.
+- **Measured, reproducible changes:** each merge says what it was measured on, before
+  and after, picture and frame time.
+- **Porting, not emulating:** the PC-native path (in-place memory, the card's own ray
+  tracing, D3D12) over compatibility layers that copy and watch the console's memory
+  every frame.
+- **Open to contributions.** Open pull requests from upstream are reviewed here in the open
+  ([CONTRIBUTING.md](CONTRIBUTING.md)), with their authors credited and asked when something
+  is unclear. Upstream is followed and its changes are taken one by one
+  (`git cherry-pick -x`) when they meet these rules.
+
+License: GPL-3.0-or-later, as upstream.
 
 ## The goal
 
 **The Series X version at 4K output (drawn at 1440p) with ray tracing on,
-looking the way it does on the Xbox**, on an AMD RX 7900 XTX first.
+looking the way it does on the Xbox**, on AMD RDNA cards (RX 7900 XTX, RX 7800 XT) first.
 
 In this order:
 
