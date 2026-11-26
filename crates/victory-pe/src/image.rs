@@ -416,10 +416,16 @@ fn parse_tls(
         let array = sections
             .pe_data_at(data, array_rva)
             .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
-        for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS) {
-            let va = u64::from_le_bytes(*slot);
+        // The limit counts callbacks, not the terminating null pointer. Read
+        // one more slot so a full array is accepted only if it is terminated.
+        for index in 0..=MAX_TLS_CALLBACKS {
+            let va = layout::read_u64(array, index * 8)
+                .ok_or_else(|| PeError::Malformed("unterminated TLS callback array".into()))?;
             if va == 0 {
                 break;
+            }
+            if index == MAX_TLS_CALLBACKS {
+                return Err(PeError::Malformed("too many TLS callbacks".into()));
             }
             callback_rvas.push(va_to_rva(va, image_base)?);
         }
@@ -548,6 +554,94 @@ mod tests {
         d.extend_from_slice(body);
         d.resize(0x400, 0);
         d
+    }
+
+    /// A TLS directory followed by exactly the supplied callback-array bytes.
+    fn synthetic_tls_image(callbacks: &[u8]) -> Vec<u8> {
+        let mut data = synthetic_image(&[]);
+        data.truncate(0x200);
+        let mut body = vec![0u8; 0x30];
+        body[24..32].copy_from_slice(&0x1_8000_1030u64.to_le_bytes());
+        body.extend_from_slice(callbacks);
+        let size = body.len() as u32;
+        data.extend_from_slice(&body);
+
+        let opt = 0x58;
+        data[opt + 112..opt + 120].fill(0); // no exports
+        let tls_dir = opt + 112 + pe::IMAGE_DIRECTORY_ENTRY_TLS * 8;
+        data[tls_dir..tls_dir + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[tls_dir + 4..tls_dir + 8].copy_from_slice(&40u32.to_le_bytes());
+        data[opt + 56..opt + 60]
+            .copy_from_slice(&(0x1000 + size).next_multiple_of(0x1000).to_le_bytes());
+        let sec = opt + 240;
+        data[sec + 8..sec + 12].copy_from_slice(&size.to_le_bytes());
+        data[sec + 16..sec + 20].copy_from_slice(&size.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn tls_callbacks_stop_at_null() {
+        let callbacks = [0x1_8000_1000u64, 0x1_8000_1008, 0, u64::MAX];
+        let bytes: Vec<_> = callbacks.into_iter().flat_map(u64::to_le_bytes).collect();
+        let info = ImageInfo::parse(&synthetic_tls_image(&bytes)).unwrap();
+        assert_eq!(info.tls.unwrap().callback_rvas, [0x1000, 0x1008]);
+    }
+
+    #[test]
+    fn tls_callbacks_allow_an_empty_array() {
+        let info = ImageInfo::parse(&synthetic_tls_image(&0u64.to_le_bytes())).unwrap();
+        assert!(info.tls.unwrap().callback_rvas.is_empty());
+    }
+
+    #[test]
+    fn tls_callbacks_require_a_null_terminator() {
+        let data = synthetic_tls_image(&0x1_8000_1000u64.to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn tls_callbacks_reject_a_partial_terminator() {
+        for trailing in 1..8 {
+            let mut bytes = 0x1_8000_1000u64.to_le_bytes().to_vec();
+            bytes.resize(8 + trailing, 0);
+            let data = synthetic_tls_image(&bytes);
+            assert!(matches!(
+                ImageInfo::parse(&data),
+                Err(PeError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn tls_callbacks_accept_the_limit_with_a_terminator() {
+        let mut bytes = 0x1_8000_1000u64.to_le_bytes().repeat(MAX_TLS_CALLBACKS);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let info = ImageInfo::parse(&synthetic_tls_image(&bytes)).unwrap();
+        assert_eq!(info.tls.unwrap().callback_rvas.len(), MAX_TLS_CALLBACKS);
+    }
+
+    #[test]
+    fn tls_callbacks_reject_unterminated_arrays_at_the_limit() {
+        let bytes = 0x1_8000_1000u64.to_le_bytes().repeat(MAX_TLS_CALLBACKS);
+        let data = synthetic_tls_image(&bytes);
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn tls_callbacks_reject_more_than_the_limit() {
+        let mut bytes = 0x1_8000_1000u64.to_le_bytes().repeat(MAX_TLS_CALLBACKS + 1);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let data = synthetic_tls_image(&bytes);
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
     }
 
     #[test]
