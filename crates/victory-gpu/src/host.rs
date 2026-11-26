@@ -562,6 +562,7 @@ fn sweep() {
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
+    crate::shadow::demote_under_pressure(host().and_then(|h| h.video_memory()));
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
 }
@@ -2131,6 +2132,137 @@ struct CardWork {
 unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
+
+/// Narrow leaf mutex serializing direct calls to `Host::queue`
+/// (`ExecuteCommandLists`, `Signal`, `Wait`, `UpdateTileMappings`) across
+/// the submitting thread, relay thread, upq wait, upcheck, tiled mappings,
+/// and card-demotion readbacks. Never held across fence waits, `BUFFERS`,
+/// `DEMOTE_COPY`, `QUEUE_ORDER`, `Tiled::given`, or `Host::submitted`.
+pub(super) static QUEUE_SUBMIT: Mutex<()> = Mutex::new(());
+
+/// Acquires the narrow leaf mutex serializing direct calls to `Host::queue`.
+pub(crate) fn queue_lock() -> std::sync::MutexGuard<'static, ()> {
+    QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Dedicated list, fence, and event for reading back cold card-resident
+/// buffers before demoting them to host RAM (`crate::shadow::demote_cold_small_global`).
+/// Staging memory is allocated transiently per batch and dropped immediately
+/// after readback so idle L0 RAM is never pinned.
+struct DemoteCopy {
+    list: Prelude,
+    fence: ID3D12Fence,
+    event: HANDLE,
+    sent: u64,
+}
+
+impl Drop for DemoteCopy {
+    fn drop(&mut self) {
+        // SAFETY: `self.event` was created by `CreateEventW` and is owned
+        // exclusively by `DemoteCopy`.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.event);
+        }
+    }
+}
+
+// SAFETY: D3D12 command allocators, lists, fences, and Win32 events are used
+// exclusively under `DEMOTE_COPY`'s mutex, one readback at a time.
+unsafe impl Send for DemoteCopy {}
+
+static DEMOTE_COPY: Mutex<Option<DemoteCopy>> = Mutex::new(None);
+
+/// Executes one fenced batch readback of `srcs` into `staging` (persistently
+/// mapped at `staging_data`) on `queue`, returning the exact bytes per source.
+/// When `queue_lock` is provided, holds it strictly across
+/// `ExecuteCommandLists` / `on_sent` / `Signal` (released before the fence wait).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn demote_readback_run(
+    allocator: &ID3D12CommandAllocator,
+    list: &ID3D12GraphicsCommandList,
+    queue: &ID3D12CommandQueue,
+    fence: &ID3D12Fence,
+    event: HANDLE,
+    signal: u64,
+    staging: &ID3D12Resource,
+    staging_data: *const u8,
+    srcs: &[(ID3D12Resource, u64)],
+    queue_lock: Option<&Mutex<()>>,
+    on_sent: Option<&dyn Fn()>,
+) -> Option<Vec<Vec<u8>>> {
+    // SAFETY: caller guarantees `allocator`/`list` are idle, `staging` holds at
+    // least `sum(len)` bytes persistently mapped at `staging_data`, every source
+    // buffer stays alive across the fence wait, and `event` is exclusive.
+    let ran = unsafe {
+        (|| -> windows::core::Result<()> {
+            allocator.Reset()?;
+            list.Reset(allocator, None)?;
+            let mut at = 0u64;
+            for (src, len) in srcs {
+                if *len > 0 {
+                    list.CopyBufferRegion(staging, at, src, 0, *len);
+                    at += *len;
+                }
+            }
+            list.Close()?;
+            let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+            {
+                let _q = queue_lock.map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+                queue.ExecuteCommandLists(&lists);
+                if let Some(sent_cb) = on_sent {
+                    sent_cb();
+                }
+                queue.Signal(fence, signal)?;
+            }
+            fence.SetEventOnCompletion(signal, event)?;
+            WaitForSingleObject(event, INFINITE);
+            Ok(())
+        })()
+    };
+    if let Err(e) = ran {
+        tracing::warn!(error = %e, "card-buffer demotion readback failed; keeping card placements");
+        return None;
+    }
+    let mut out = Vec::with_capacity(srcs.len());
+    let mut at = 0usize;
+    for &(_, len) in srcs {
+        let len = len as usize;
+        if len == 0 {
+            out.push(Vec::new());
+            continue;
+        }
+        // SAFETY: the GPU copy into `staging[at..at + len]` has completed and
+        // `staging` is persistently mapped at `staging_data`.
+        let slice = unsafe { std::slice::from_raw_parts(staging_data.add(at), len) };
+        out.push(slice.to_vec());
+        at += len;
+    }
+    Some(out)
+}
+
+/// Stamps every `Shadow` touched by `runs` or `card` with the host fence value
+/// `fence` being signalled behind this submission, so card-buffer demotion
+/// never drops a buffer still in flight on the GPU.
+fn note_submitted_shadows(runs: &[&HostList], card: Option<&CardPlan>, fence: u64) {
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                Step::Refresh(shadow, _, _) | Step::GpuWrite(shadow, _, _) => {
+                    shadow.note_gpu_fence(fence);
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(plan) = card {
+        for shadow in &plan._synced {
+            shadow.note_gpu_fence(fence);
+        }
+        for r in &plan.ranges {
+            r.shadow.note_gpu_fence(fence);
+        }
+    }
+}
 
 /// The compare of a declared range of a copy in the card's memory with
 /// its bytes from before, one group per 64 KiB piece (cut at multiples of
@@ -4299,16 +4431,16 @@ impl Host {
         Some(clock)
     }
 
-    /// Lists of ours just went to the queue: the clock's signal goes
-    /// behind them, and an idle stretch of the card, if one was under way,
-    /// ends here ([`CARD_CLOCK_US`]).
-    fn card_sent(&self) {
+    /// Lists of ours just went to the queue (caller holds [`QUEUE_SUBMIT`]):
+    /// the clock's signal goes behind them, and an idle stretch of the card,
+    /// if one was under way, ends here ([`CARD_CLOCK_US`]).
+    fn card_sent_locked(&self) {
         let Some(clock) = self.card_clock() else {
             return;
         };
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
         state.0 += 1;
-        // SAFETY: our queue and the clock's fence.
+        // SAFETY: our queue (serialized by `QUEUE_SUBMIT`) and the clock's fence.
         let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
         if let Some((since, worked_then)) = state.1.take() {
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -4316,6 +4448,72 @@ impl Host {
         }
         drop(state);
         clock.sent.notify_one();
+    }
+
+    /// The highest value completed on the host's main queue fence.
+    pub(crate) fn completed_fence(&self) -> u64 {
+        // SAFETY: a plain query on a live fence.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
+    /// Copies each `(src_vram_buffer, byte_len)` from card memory into a
+    /// transient CPU-visible staging buffer on `self.queue`, waits for a
+    /// dedicated fence, and returns the exact bytes of each buffer. Returns
+    /// `None` (and resets the internal `DemoteCopy` so it is never left
+    /// poisoned) if D3D12 copy or fence sync fails.
+    pub(crate) fn demote_readback(&self, srcs: &[(ID3D12Resource, u64)]) -> Option<Vec<Vec<u8>>> {
+        if srcs.is_empty() {
+            return Some(Vec::new());
+        }
+        let total: u64 = srcs.iter().try_fold(0u64, |acc, &(_, len)| acc.checked_add(len))?;
+        if total == 0 {
+            return Some(srcs.iter().map(|_| Vec::new()).collect());
+        }
+        // Allocate staging transiently so up to 16 MiB of L0 RAM is released
+        // immediately once this demotion batch finishes.
+        let (staging, data) = self.shared_buffer(total.next_multiple_of(64 << 10))?;
+        let mut slot = DEMOTE_COPY.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            let list = self.make_prelude()?;
+            // SAFETY: plain D3D12 fence and Win32 auto-reset event.
+            let made = unsafe {
+                (|| -> windows::core::Result<DemoteCopy> {
+                    let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                    let event = CreateEventW(None, false, false, None)?;
+                    Ok(DemoteCopy {
+                        list,
+                        fence,
+                        event,
+                        sent: 0,
+                    })
+                })()
+            };
+            *slot = made.ok();
+        }
+        let copy = slot.as_mut()?;
+        copy.sent += 1;
+        let on_sent = || self.card_sent_locked();
+        let result = demote_readback_run(
+            &copy.list.0,
+            &copy.list.1,
+            &self.queue,
+            &copy.fence,
+            copy.event,
+            copy.sent,
+            &staging,
+            data.cast_const(),
+            srcs,
+            Some(&QUEUE_SUBMIT),
+            Some(&on_sent),
+        );
+        if result.is_none() {
+            // Reset `DemoteCopy` (closing its Win32 event via `Drop`) so a
+            // failed `Reset`/`Close`/`Signal` never poisons future readbacks.
+            *slot = None;
+        }
+        drop(slot);
+        drop(staging);
+        result
     }
 
     /// Whether the host has what copies in the card's memory need (three
@@ -4573,6 +4771,7 @@ impl Host {
                         }
                     }
                     list.Close()?;
+                    let _q = QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -4942,12 +5141,16 @@ impl Host {
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
-                let after = *order;
-                drop(order);
-                self.card_sent();
-                self.queue.Signal(&fence, sent)?;
+                let after = {
+                    let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    let _q = QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+                    self.queue.ExecuteCommandLists(&lists);
+                    let after = *order;
+                    drop(order);
+                    self.card_sent_locked();
+                    self.queue.Signal(&fence, sent)?;
+                    after
+                };
                 meanwhile();
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
@@ -5234,10 +5437,13 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    self.card_sent();
-                    *submitted += 1;
-                    self.queue.Signal(&self.fence, *submitted)?;
+                    {
+                        let _q = QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        self.card_sent_locked();
+                        *submitted += 1;
+                        self.queue.Signal(&self.fence, *submitted)?;
+                    }
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -5900,6 +6106,7 @@ impl Host {
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
+            note_submitted_shadows(runs, card.as_ref(), *submitted);
             #[cfg(feature = "diagnostics")]
             if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
@@ -5907,19 +6114,24 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
-                }
-                self.queue.Signal(&self.fence, *submitted)
+            // SAFETY: closed lists; the fence is ours; `QUEUE_SUBMIT`
+            // serializes queue operations against relay, upq, and demote readbacks.
+            let signalled = {
+                let _q = QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+                let res = unsafe {
+                    let mut from = 0;
+                    for to in cuts.into_iter().chain([lists.len()]) {
+                        self.queue.ExecuteCommandLists(&lists[from..to]);
+                        from = to;
+                    }
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                self.card_sent_locked();
+                res
             };
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
-            self.card_sent();
             stage.next("submit: noting what is in the air");
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -5965,16 +6177,21 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [(&lists[..], ())];
         submitting(2, runs.len());
-        for (_i, &(group, _kind)) in groups.iter().enumerate() {
+        for (i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
+            if i == 0 {
+                note_submitted_shadows(runs, card.as_ref(), *submitted + (groups.len() - 1) as u64);
+            }
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
-                self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
+                let signalled = {
+                    let _q = QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+                    self.queue.ExecuteCommandLists(group);
+                    self.card_sent_locked();
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                let waited = signalled
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
@@ -6022,7 +6239,7 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (_i, started);
+            let _ = (i, started);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -9132,13 +9349,19 @@ impl Meter {
                 );
                 if crate::shadow::cards() {
                     let per_frame = |i: usize| card[i] as f64 / frames;
+                    let tier = crate::shadow::card_tier_stats();
                     tracing::info!(
-                        "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
+                        "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; \
+                         card_demoted_count={} card_demoted_bytes={} ({} MB) card_reserved_large_rejects={}; per frame: \
                          {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
                          ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
                         card[7],
                         card[8] >> 20,
                         card[9] >> 20,
+                        tier.card_demoted_count,
+                        tier.card_demoted_bytes,
+                        tier.card_demoted_bytes >> 20,
+                        tier.card_reserved_large_rejects,
                         per_frame(0) / 1e6,
                         per_frame(1),
                         per_frame(2),

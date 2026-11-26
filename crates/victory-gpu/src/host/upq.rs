@@ -190,8 +190,13 @@ pub(super) unsafe fn send(
         STATS[3].fetch_add(1, Relaxed);
         return None;
     }
-    // SAFETY: a fence of ours that the copy queue signals.
-    if let Err(e) = unsafe { drawing.Wait(&q.fence, q.sent) } {
+    // SAFETY: a fence of ours that the copy queue signals; serialized with
+    // direct queue submissions via `QUEUE_SUBMIT`.
+    let waited = {
+        let _q = super::QUEUE_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { drawing.Wait(&q.fence, q.sent) }
+    };
+    if let Err(e) = waited {
         // The drawing queue cannot be made to wait: wait here, so that
         // what follows still finds the bytes.
         tracing::warn!(error = %e, "the drawing queue could not wait for the up queue: waited on the CPU");

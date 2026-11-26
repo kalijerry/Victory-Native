@@ -552,8 +552,10 @@ impl Tiled {
             // SAFETY: a live reserved texture and a live heap of ours; one
             // region of `tiles` tiles from the subresource's first tile;
             // `runs.len()` ranges whose counts add up to `tiles`, in three
-            // arrays of that length that live through the call.
+            // arrays of that length that live through the call. Serialized
+            // with direct `Host::queue` submissions via `host::queue_lock()`.
             unsafe {
+                let _q = crate::host::queue_lock();
                 queue.UpdateTileMappings(
                     texture,
                     1,
