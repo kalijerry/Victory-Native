@@ -8922,6 +8922,20 @@ impl Meter {
             tracing::warn!(?status, "swap chain did not present the frame");
         }
         self.last_present = status;
+        #[cfg(feature = "diagnostics")]
+        if status == windows::Win32::Foundation::DXGI_STATUS_OCCLUDED {
+            tracing::debug!(
+                target: "victory_gpu::offscreen_frame",
+                frame = crate::frame::current(),
+                draws = crate::draw::drawn(),
+                prepare_total_us = SUBMISSION_US[0].load(Ordering::Relaxed),
+                copy_back_total_us = COPY_BACK[0].load(Ordering::Relaxed),
+                card_idle_total_us = CARD_CLOCK_US[0].load(Ordering::Relaxed),
+                card_idle_during_submit_total_us = CARD_CLOCK_US[1].load(Ordering::Relaxed),
+                "rendered frame for an occluded window"
+            );
+        }
+
         if status != S_OK {
             return false;
         }
