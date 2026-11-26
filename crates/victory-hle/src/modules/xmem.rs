@@ -1192,6 +1192,12 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    let Some(len) = n.checked_mul(PAGE) else {
+        return std::ptr::null_mut();
+    };
+    if base.checked_add(len).is_none() {
+        return std::ptr::null_mut();
+    }
     // Read before any lock is taken: a fault in title memory may wait for
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
@@ -1213,7 +1219,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    unmap(&mut physical, base, len);
     let Some(pages) = pages else {
         return address;
     };
@@ -1849,7 +1855,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let end = base + len;
+    let Some(end) = base.checked_add(len) else {
+        return;
+    };
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
     let first = physical
@@ -2686,5 +2694,16 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn map_physical_pages_rejects_overflowing_count_and_end() {
+        let too_many = usize::MAX / PAGE + 1;
+        let dummy_page = [0usize];
+        assert!(XMemMapPhysicalPages(PAGE as *mut c_void, too_many, std::ptr::null()).is_null());
+        assert!(XMemMapPhysicalPages(PAGE as *mut c_void, too_many, dummy_page.as_ptr()).is_null());
+        assert!(XMemMapPhysicalPages((usize::MAX - PAGE + 1) as *mut c_void, 2, std::ptr::null()).is_null());
+        let mut phys = physical();
+        unmap(&mut phys, usize::MAX - PAGE + 1, 2 * PAGE);
     }
 }
