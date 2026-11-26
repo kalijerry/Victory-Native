@@ -3,6 +3,8 @@
 //! ms of one recording thread at the frame's first list that needs it, with
 //! the submission of that list, and of those behind it, waiting.
 //! `VICTORY_HEAP_PASS_ASIDE=0`: done where it is needed, as before.
+//! FG3 defaults to the inline pass after a crash in the background worker.
+//! Set the switch to `1` explicitly to compare the two paths.
 //!
 //! What it finds are refreshes of host copies, which are steps of the list
 //! for its submission, and what it makes are descriptors, which the card
@@ -44,7 +46,17 @@ impl Coming {
 
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_ASIDE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        if let Some(value) = std::env::var_os("VICTORY_HEAP_PASS_ASIDE") {
+            return value != "0";
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::framegen::enabled() && !crate::framegen::ml_enabled() {
+            tracing::info!("FidelityFX FG3: using the inline descriptor heap pass");
+            return false;
+        }
+        true
+    })
 }
 
 type Job = Box<dyn FnOnce() + Send>;
