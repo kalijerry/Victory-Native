@@ -7,8 +7,8 @@ const GIB: usize = 1 << 30;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Console {
-    #[default]
     SeriesX,
+    #[default]
     SeriesS,
 }
 

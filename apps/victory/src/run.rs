@@ -101,6 +101,11 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
+    let console = match std::env::var("VICTORY_CONSOLE") {
+        Ok(v) if v.eq_ignore_ascii_case("series-x") || v.eq_ignore_ascii_case("seriesx") => Console::SeriesX,
+        Ok(v) if v.eq_ignore_ascii_case("series-s") || v.eq_ignore_ascii_case("seriess") => Console::SeriesS,
+        _ => console,
+    };
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,
         Console::SeriesS => victory_hle::console::Console::SeriesS,

@@ -42,4 +42,11 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-env=VICTORY_TRANSLATOR={}", hash.finalize().to_hex());
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        cc::Build::new()
+            .file("src/pipeline/seh_guard.c")
+            .compile("victory_seh_guard");
+        println!("cargo:rerun-if-changed=src/pipeline/seh_guard.c");
+    }
 }

@@ -19,6 +19,7 @@ victory-shader = { workspace = true, features = ["host"] }
 
 [build-dependencies]
 blake3.workspace = true
+cc = "1.1"
 
 [dev-dependencies]
 tempfile.workspace = true
