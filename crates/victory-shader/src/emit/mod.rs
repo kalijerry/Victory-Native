@@ -897,7 +897,9 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
-    let mut out = Vec::with_capacity(count);
+    // Rows are 32 bytes: a count from a corrupt part must not reserve more
+    // than the part could hold (failing to reserve aborts the process).
+    let mut out = Vec::with_capacity(count.min(part.len() / 32));
     for i in 0..count {
         let at = base + 32 * i;
         let name_at = u32_at(part, at + 4)? as usize;
@@ -905,9 +907,12 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             .get(name_at..)
             .and_then(|s| s.split(|&b| b == 0).next())
             .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
+        // Four components: bits above them name none (a wider mask made
+        // `cols` up to 8, and `1 << cols` overflow where masks are made).
         let mask = *part
             .get(at + 24)
-            .ok_or(ShaderError::Malformed("truncated"))?;
+            .ok_or(ShaderError::Malformed("truncated"))?
+            & 0xF;
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -989,6 +994,38 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// A corrupt signature part: a row count far beyond the part is refused
+    /// as malformed (not a reservation of some 200 GB, which aborts), and a
+    /// mask byte wider than four components still gives at most four.
+    #[test]
+    fn malformed_signature_parts_are_refused_or_kept_to_four_components() {
+        let row = super::container::SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 3,
+            cols: 1,
+            usage: 0,
+            half: false,
+        };
+        let mut part = super::container::signature(&[row], true);
+        assert_eq!(super::signature(&part).map(|rows| rows.len()), Ok(1));
+
+        let mut huge = part.clone();
+        huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(super::signature(&huge), Err(crate::ShaderError::Malformed(_))));
+
+        let base = u32::from_le_bytes(part[4..8].try_into().unwrap()) as usize;
+        part[base + 24] = 0xff;
+        let rows = super::signature(&part).unwrap();
+        assert_eq!((rows[0].col, rows[0].cols), (0, 4));
+        // Writing it again makes its mask (`1 << cols`) without overflow.
+        super::container::signature(&rows, true);
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
