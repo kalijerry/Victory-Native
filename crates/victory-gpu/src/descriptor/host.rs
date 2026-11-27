@@ -154,7 +154,7 @@ impl Pool {
         Self { taken: vec![false; n], at: if n == 0 { Default::default() } else { [(0, n)].into() }, by_len, end: n }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn free(&self) -> u32 {
         self.at.values().sum::<usize>() as u32
     }
@@ -298,7 +298,7 @@ impl Pools {
         Self { shards, size, next: Default::default(), wide: Mutex::new(()) }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn free(&self) -> u32 {
         self.shards.iter().map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).free()).sum()
     }
@@ -1771,13 +1771,6 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
-
-/// The size of every host view heap on a host that takes more than
-/// [`PORTABLE_VIEWS`] (AMD): the title's heap (a little over 1,000,000
-/// views in the retail game) plus [`DYNAMIC`] fits with room to spare, and
-/// the last slot is the null slot every view index at or past it reads.
-#[allow(dead_code)]
-const UNCAPPED_VIEWS: u32 = 1 << 21;
 
 /// Where the raw twins of the title's slots start in a heap that has them
 /// ([`raw_twins`]): past every slot a title's heap and the dynamic ones take.
