@@ -3089,32 +3089,6 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(*found as This)
 }
 
-/// Addresses in [`PLACED_TEXTURES`] whose resource description matches
-/// `desc` with the filler words (1 and 13) ignored, and how many keys
-/// matched: whether a view with no address of its own can be tied to one
-/// texture, and how tightly (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn placed_textures_like(desc: &[u32; 14]) -> (usize, Vec<u64>) {
-    let mut key = *desc;
-    key[1] = 0;
-    key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    let mut keys = 0;
-    let mut addresses: Vec<u64> = Vec::new();
-    for ((address, other), _) in map.iter() {
-        let mut blank = *other;
-        blank[1] = 0;
-        blank[13] = 0;
-        if blank == key {
-            keys += 1;
-            if !addresses.contains(address) && addresses.len() < 8 {
-                addresses.push(*address);
-            }
-        }
-    }
-    (keys, addresses)
-}
-
 /// From which level on the title texture's host copy was filled, and from
 /// which bytes (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -3187,10 +3161,25 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(out)
 }
 
-/// The title resource the GPU writes at `address`, held while a descriptor
-/// made from it lives. A synthetic stand-in is made only when the title has
-/// created none: one must never displace a title object (writes would go
-/// to a copy nothing else sees).
+/// Whether an existing resource is of the shape a view asks for: the same
+/// dimension, size, levels, layers, format and samples, carrying every flag
+/// it asks for. (The alignment asked for is a request at creation, not part
+/// of the resource's shape.)
+#[cfg(windows)]
+fn same_resource(existing: &ResourceDesc, wanted: &ResourceDesc) -> bool {
+    existing.dimension == wanted.dimension
+        && existing.width == wanted.width
+        && existing.height == wanted.height
+        && existing.depth_or_array_size == wanted.depth_or_array_size
+        && existing.mip_levels == wanted.mip_levels
+        && existing.format == wanted.format
+        && existing.sample_count == wanted.sample_count
+        && existing.flags & wanted.flags == wanted.flags
+}
+/// The title resource the GPU writes at that address, held while a
+/// descriptor made from it lives. A synthetic stand-in is made only when
+/// the title has created none: one must never displace a title object
+/// (writes would go to a copy nothing else sees).
 #[cfg(windows)]
 pub(crate) fn writable_texture_at(address: u64, words: &[u32; 14]) -> Option<ResourceRef> {
     // SAFETY: 56 bytes in the title resource description's layout.
@@ -3198,28 +3187,30 @@ pub(crate) fn writable_texture_at(address: u64, words: &[u32; 14]) -> Option<Res
     if address == 0 || !(2..=4).contains(&desc.dimension) || desc.flags & 4 == 0 {
         return None;
     }
+    // The memory may hold several placed resources (the title aliases
+    // transient ones). Title allocations stay last, so the first match from
+    // that end is the one to use; an object another thread is dropping is
+    // skipped by its failed reference.
     let find = || {
         let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-        let target = *targets.get(&address)?.last()? as This;
-        if !object::try_add_ref(target) {
-            return Some(None);
+        for &target in targets.get(&address)?.iter().rev() {
+            let target = target as This;
+            if !object::try_add_ref(target) {
+                continue;
+            }
+            let owner = ResourceRef(target as usize);
+            if same_resource(&resource(owner.as_ptr()).desc, &desc) {
+                return Some(owner);
+            }
         }
-        let owner = ResourceRef(target as usize);
-        drop(targets);
-        let existing = resource(owner.as_ptr()).desc;
-        let same_shape = ResourceDesc {
-            alignment: desc.alignment,
-            flags: desc.flags,
-            ..existing
-        } == desc;
-        Some((same_shape && existing.flags & desc.flags == desc.flags).then_some(owner))
+        None
     };
     if let Some(owner) = find() {
-        return owner;
+        return Some(owner);
     }
-    let texture = texture_at(address, words)?;
-    // Another title object may have arrived while making the synthetic one.
-    find().unwrap_or_else(|| Some(ResourceRef::new(texture)))
+    // (The map's own reference of the placed copy keeps it after this.)
+    let texture = ResourceRef::new(texture_at(address, words)?);
+    find().or(Some(texture))
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -4688,6 +4679,67 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// A view's shape is matched without the alignment it asks for, and
+    /// only when the resource carries every flag it asks for.
+    #[test]
+    fn a_resource_matches_a_view_of_its_shape_and_flags() {
+        let wanted = ResourceDesc { flags: 4, ..texture(64, 64, 98, 1) };
+        assert!(same_resource(&wanted, &wanted));
+        assert!(same_resource(&ResourceDesc { flags: 6, ..wanted }, &wanted));
+        assert!(!same_resource(&ResourceDesc { width: 128, ..wanted }, &wanted));
+        assert!(!same_resource(&ResourceDesc { flags: 0, ..wanted }, &wanted));
+        let asked_for_more = ResourceDesc { flags: 6, ..wanted };
+        assert!(!same_resource(&wanted, &asked_for_more));
+    }
+
+    /// Placed resources can share one address (the title aliases transient
+    /// allocations). A view of a shape finds the newest owner of that shape,
+    /// skipping an owner of another one and any synthetic copy, which never
+    /// displaces a title resource.
+    #[cfg(windows)]
+    #[test]
+    fn a_writable_texture_skips_alias_owners_of_another_shape() {
+        let null = std::ptr::null();
+        let heap = heap(4 * KIB_64);
+        let place = |desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(
+                create_placed(null, heap, KIB_64, desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            out
+        };
+        let wide = ResourceDesc { flags: 4, ..texture(64, 64, 98, 1) };
+        let narrow = ResourceDesc { flags: 4, ..texture(32, 32, 98, 1) };
+        let words = |d: &ResourceDesc| unsafe { std::mem::transmute_copy::<ResourceDesc, [u32; 14]>(d) };
+        let first = place(&wide);
+        let alias = place(&narrow);
+        let last = place(&wide);
+        // SAFETY: a live placed resource.
+        let address = slot::<Address>(first, 0x58)(first);
+        assert_ne!(address, 0);
+        {
+            let held = writable_texture_at(address, &words(&wide)).unwrap();
+            assert_eq!(held.as_ptr(), last, "the newest owner of the shape");
+            let held = writable_texture_at(address, &words(&narrow)).unwrap();
+            assert_eq!(held.as_ptr(), alias, "the other owner's shape");
+            // A shape no owner has gets a synthetic copy at that address.
+            let other = ResourceDesc { width: 16, ..wide };
+            let held = writable_texture_at(address, &words(&other)).unwrap();
+            assert_ne!(held.as_ptr(), first);
+            assert_ne!(held.as_ptr(), alias);
+            assert_ne!(held.as_ptr(), last);
+            let again = writable_texture_at(address, &words(&wide)).unwrap();
+            assert_eq!(again.as_ptr(), last, "the synthetic copy displaces nothing");
+        }
+        // (Each placement gave the resource one reference and held the heap;
+        // releasing goes with the resource.)
+        assert_eq!(slot::<Release>(first, 0x10)(first), 0);
+        assert_eq!(slot::<Release>(alias, 0x10)(alias), 0);
+        assert_eq!(slot::<Release>(last, 0x10)(last), 0);
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
     }
 
     #[test]

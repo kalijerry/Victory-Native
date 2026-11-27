@@ -421,6 +421,20 @@ mod tests {
         this
     }
 
+    /// A reference is taken from a live object and refused from one whose
+    /// last was let go (the caller then knows its pointer is stale).
+    #[test]
+    fn a_reference_is_taken_only_from_a_live_object() {
+        let this = new_test_object();
+        let release = slot::<extern "system" fn(This) -> u32>(this, 0x10);
+        assert_eq!(add_ref(this), 2);
+        assert_eq!(release(this), 1);
+        assert!(try_add_ref(this), "one reference was live");
+        assert_eq!(release(this), 1);
+        assert_eq!(release(this), 0);
+        assert!(!try_add_ref(this), "the last reference is gone");
+    }
+
     #[test]
     fn private_data_is_scoped_to_object_and_id() {
         let first = new_test_object();

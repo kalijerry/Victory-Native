@@ -4544,24 +4544,11 @@ fn make_twinned(
                     h.finish()
                 };
                 let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-                let mut around = [0u32; 48];
-                // SAFETY: the title's own record around the description.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        std::ptr::from_ref(desc).cast::<u32>().sub(24),
-                        around.as_mut_ptr(),
-                        around.len(),
-                    )
-                };
                 if (said.len() < 512 && said.insert(key)) || times.is_power_of_two() {
-                    #[cfg(all(windows, feature = "diagnostics"))]
-                    let (keys, addresses) = crate::resource::placed_textures_like(resource);
-                    #[cfg(not(all(windows, feature = "diagnostics")))]
-                    let (keys, addresses): (usize, Vec<u64>) = (0, Vec::new());
                     tracing::warn!(
                         address = format_args!("{at:#x}"),
                         times,
-                        "placed unordered texture view that is not mirrored (null: writes through it are lost): unordered {unordered}, resource {resource:?}, desc {desc:?}, around {around:?}, matches {keys}, addresses {addresses:?}",
+                        "placed unordered texture view that is not mirrored (null: writes through it are lost): resource {resource:?}, desc {desc:?}",
                     );
                 }
                 return None;
@@ -4950,14 +4937,6 @@ pub(crate) fn placed_texture(view: &View) -> Option<PlacedTexture> {
     let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
-    #[cfg(feature = "diagnostics")]
-    if *unordered && resource[0] != BUFFER && resource[12] & 4 == 0 {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 24 {
-            tracing::warn!(n, "placed texture UAV probe: resource {resource:?} desc {desc:?}");
-        }
-    }
     if resource[0] == BUFFER || (*unordered && resource[12] & 4 == 0) {
         return None;
     }
